@@ -1,25 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 一加分屏增强修改了 CanvasPlus 的应用清单。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.canvasplus"
-    android:versionCode="2"
-    android:versionName="0.2.0">
+    android:versionCode="15"
+    android:versionName="0.2.13">
 
     <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="36" />
 
     <application
         android:hasCode="true"
-        android:label="CanvasPlus">
+        android:label="一加分屏增强">
 
         <activity
             android:name=".SettingsActivity"
             android:exported="true"
-            android:label="CanvasPlus"
+            android:label="一加分屏增强"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <receiver
+            android:name="com.canvasplus.SettingsReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.canvasplus.READ_SETTINGS" />
+            </intent-filter>
+        </receiver>
 
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription"

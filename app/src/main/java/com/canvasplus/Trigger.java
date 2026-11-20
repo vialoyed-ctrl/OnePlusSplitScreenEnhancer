@@ -1,4 +1,7 @@
+// 一加分屏增强修改了 CanvasPlus 的此源文件。
 package com.canvasplus;
+
+import static com.canvasplus.CanvasApi.Member.*;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -60,6 +63,7 @@ final class Trigger {
         IntentFilter filter = new IntentFilter(ACTION_START);
         filter.addAction(ACTION_ADD);
         filter.addAction(ACTION_LAYOUT);
+        filter.addAction(Settings.ACTION_CHANGED);
         return filter;
     }
 
@@ -90,6 +94,10 @@ final class Trigger {
 
             BroadcastReceiver receiver = new BroadcastReceiver() {
                 @Override public void onReceive(Context ctx, Intent intent) {
+                    if (Settings.ACTION_CHANGED.equals(intent.getAction())) {
+                        Settings.receiveUpdate(getSentFromPackage(), intent);
+                        return;
+                    }
                     if (ACTION_LAYOUT.equals(intent.getAction())) {
                         CanvasLayout.applyOrientation(intent.getIntExtra("orientation", 0));
                         return;
@@ -105,6 +113,12 @@ final class Trigger {
                         boolean visible = isForeground(activity);
                         boolean room = count >= 0 && count < 4;
                         log("add request " + pkg + " visible=" + visible + " count=" + count);
+                        if (CanvasApi.isColorOs17()) {
+                            boolean accepted = visible && room && count >= 2
+                                    && addOnColorOs17(context, activity, pkg, count);
+                            if (isOrderedBroadcast()) setResultCode(accepted ? 1 : 0);
+                            return;
+                        }
                         if (intent.getBooleanExtra("ordered", false)) {
                             setResultCode(visible && room ? 1 : 0);
                         }
@@ -115,14 +129,20 @@ final class Trigger {
                     String[] packages = intent.getStringArrayExtra(EXTRA_PACKAGES);
                     if (packages == null || packages.length == 0) return;
                     CanvasLayout.forcedMode = intent.getIntExtra("mode", 0);
+                    if (CanvasApi.isColorOs17()) {
+                        CanvasLayout.forcedOrientation = CanvasLayout.forcedMode >= 3
+                                && CanvasLayout.forcedMode <= 7 ? CanvasLayout.forcedMode
+                                : CanvasLayout.DEFAULT_ORIENTATION;
+                    }
                     log("trigger " + Arrays.toString(packages) + " mode=" + CanvasLayout.forcedMode);
                     startPocketStudio(context, loader, packages);
-                    enterWorkspace(loader, packages);
+                    if (!CanvasApi.isColorOs17()) enterWorkspace(loader, packages);
                 }
             };
             context.registerReceiver(receiver, buildFilter(),
                     Context.RECEIVER_EXPORTED);
             armed = true;
+            Settings.refresh(context);
             log("trigger armed");
             return true;
         } catch (Throwable error) {
@@ -136,11 +156,30 @@ final class Trigger {
     private static void addToCanvas(android.content.Context context, String pkg) {
         addToCanvas(context, pkg, 0);
     }
+
+    private static boolean addOnColorOs17(Context context, Object activity, String pkg, int before) {
+        Intent launch = context.getPackageManager().getLaunchIntentForPackage(pkg);
+        if (launch == null) return false;
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            XposedHelpers.callMethod(activity, ADD_TASK.value(), launch, 0, false);
+        } catch (LinkageError | RuntimeException error) {
+            log("add activity failed: " + error);
+        }
+        if (canvasCount(activity) == before) addDirect(activity, launch);
+        int after = canvasCount(activity);
+        log("add " + pkg + " " + before + "->" + after);
+        return after > before;
+    }
+
     /** 加完窗口后画布可能还在动画里没重排，补一次。 */
     private static void relayoutLater(final Object activity) {
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             try {
-                XposedHelpers.callMethod(activity, "N2");
+                Object view = XposedHelpers.callMethod(activity, ACTIVITY_VIEW.value());
+                if (view != null && canvasCount(activity) >= 3 && isForeground(activity)) {
+                    XposedHelpers.callMethod(view, LAYOUT.value());
+                }
             } catch (Throwable ignored) {
             }
         }, 300L);
@@ -150,32 +189,30 @@ final class Trigger {
      * 直接走 s0.d() 加窗口，绕开 ContainerActivity.j0() 里那些前置检查。
      * j0 里只要有一步对不上就静默返回，表现就是"点了没反应"。
      */
-    private static boolean addDirect(Object activity, android.content.Context context,
-                                     Intent launch) {
+    private static boolean addDirect(Object activity, Intent launch) {
         try {
-            Object view = XposedHelpers.callMethod(activity, "x0");
+            Object view = XposedHelpers.callMethod(activity, ACTIVITY_VIEW.value());
             if (view == null) return false;
-            Object adapter = adapterOf(view);
+            Object adapter = CanvasApi.adapter(view);
             if (adapter == null) return false;
             // s0 内部会把 context 强转成 ContainerActivity，必须传 Activity 本身
+            Class<?> util = XposedHelpers.findClass(UTIL.value(), activity.getClass().getClassLoader());
             Object taskData = XposedHelpers.callStaticMethod(
-                    XposedHelpers.findClass("B1.l", activity.getClass().getClassLoader()),
-                    "n0", activity, launch, -2, -1);
+                    util, CREATE_TASK.value(), activity, launch, -2, -1);
             if (taskData == null) {
                 Object bounds = null;
                 try {
-                    bounds = XposedHelpers.callStaticMethod(
-                            XposedHelpers.findClass("B1.l",
-                                    activity.getClass().getClassLoader()),
-                            "o", activity, launch, -2, 0);
+                    bounds = CanvasApi.isColorOs17()
+                            ? XposedHelpers.callStaticMethod(util, "o", launch, -2, 0)
+                            : XposedHelpers.callStaticMethod(util, "o", activity, launch, -2, 0);
                 } catch (Throwable ignored) {
                 }
                 log("add direct: taskData null bounds=" + bounds
                         + " extra=" + launch.getExtras());
                 return false;
             }
-            XposedHelpers.callMethod(taskData, "s0", 0);
-            XposedHelpers.callMethod(taskData, "l0",
+            XposedHelpers.callMethod(taskData, TASK_USER.value(), 0);
+            XposedHelpers.callMethod(taskData, TASK_ID.value(),
                     launch.getIntExtra("androidx.activity.LaunchEmbeddedTaskId", -1));
             Object controller = XposedHelpers.callMethod(view, "getContainerController");
             XposedHelpers.callMethod(controller, "d", taskData);
@@ -184,19 +221,6 @@ final class Trigger {
             log("add direct failed: " + error);
             return false;
         }
-    }
-
-    private static Object adapterOf(Object view) {
-        for (java.lang.reflect.Field field : view.getClass().getDeclaredFields()) {
-            if (field.getType().getName().equals("u1.c")) {
-                try {
-                    field.setAccessible(true);
-                    return field.get(view);
-                } catch (Throwable ignored) {
-                }
-            }
-        }
-        return null;
     }
 
     /**
@@ -222,7 +246,7 @@ final class Trigger {
                     return;
                 }
                 try {
-                    XposedHelpers.callMethod(activity, "j0", launch, 0, false);
+                    XposedHelpers.callMethod(activity, ADD_TASK.value(), launch, 0, false);
                     int after = canvasCount(activity);
                     log("j0 add " + pkg + " " + before + "->" + after
                             + " try=" + attempt);
@@ -235,7 +259,7 @@ final class Trigger {
                 }
 
                 // j0 里那串前置检查（a2/rectList 对齐）比较脆，直接用 s0.d() 加
-                if (addDirect(activity, context, launch)) {
+                if (addDirect(activity, launch)) {
                     int now = canvasCount(activity);
                     log("direct add " + pkg + " " + before + "->" + now
                             + " try=" + attempt);
@@ -254,7 +278,7 @@ final class Trigger {
 
             Intent canvas = new Intent();
             canvas.setClassName("com.oplus.pscanvas",
-                    "com.oplus.pscanvas.canvasmode.canvas.ContainerActivity");
+                    CanvasApi.ACTIVITY);
             canvas.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                     | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             Bundle extra = new Bundle();
@@ -287,16 +311,9 @@ final class Trigger {
     /** 当前画布里的窗口数量。 */
     private static int canvasCount(Object activity) {
         try {
-            Object view = XposedHelpers.callMethod(activity, "x0");
+            Object view = XposedHelpers.callMethod(activity, ACTIVITY_VIEW.value());
             if (view == null) return -1;
-            Object adapter = null;
-            for (java.lang.reflect.Field field : view.getClass().getDeclaredFields()) {
-                if (field.getType().getName().equals("u1.c")) {
-                    field.setAccessible(true);
-                    adapter = field.get(view);
-                    break;
-                }
-            }
+            Object adapter = CanvasApi.adapter(view);
             if (adapter == null) return -1;
             Object value = XposedHelpers.callMethod(adapter, "getCount");
             return value instanceof Integer ? (Integer) value : -1;
@@ -319,7 +336,7 @@ final class Trigger {
                 Object activity = XposedHelpers.getObjectField(record, "activity");
                 if (activity == null) continue;
                 if (!activity.getClass().getName().equals(
-                        "com.oplus.pscanvas.canvasmode.canvas.ContainerActivity")) {
+                        CanvasApi.ACTIVITY)) {
                     continue;
                 }
                 try {

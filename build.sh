@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 一加分屏增强修改了 CanvasPlus 的构建脚本。
 #
 # 依赖：Android SDK（build-tools + platform 36）、JDK 17 以上。
 # 路径默认取 ANDROID_HOME / JAVA_HOME，可以用环境变量覆盖：
@@ -80,8 +81,8 @@ echo "== sign =="
     --ks-key-alias androiddebugkey \
     --ks-pass pass:android \
     --key-pass pass:android \
-    --out dist/CanvasPlus.apk \
+    --out dist/OnePlusSplitScreenEnhancer.apk \
     build/aligned.apk
 
-ls -lh dist/CanvasPlus.apk
+ls -lh dist/OnePlusSplitScreenEnhancer.apk
 echo "done"

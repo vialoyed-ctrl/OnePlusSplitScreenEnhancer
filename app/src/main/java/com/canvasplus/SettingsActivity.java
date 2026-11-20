@@ -1,3 +1,4 @@
+// 一加分屏增强修改了 CanvasPlus 的此源文件。
 package com.canvasplus;
 
 import android.app.Activity;
@@ -15,7 +16,8 @@ public final class SettingsActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setTitle("CanvasPlus");
+        CharSequence appName = getApplicationInfo().loadLabel(getPackageManager());
+        setTitle(appName);
 
         boolean night = (getResources().getConfiguration().uiMode
                 & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
@@ -36,7 +38,7 @@ public final class SettingsActivity extends Activity {
         root.setBackgroundColor(background);
 
         TextView title = new TextView(this);
-        title.setText("CanvasPlus");
+        title.setText(appName);
         title.setTextSize(24);
         title.setTextColor(primary);
         title.setPadding(0, gap, 0, gap);

@@ -1,3 +1,4 @@
+// 一加分屏增强修改了 CanvasPlus 的此源文件。
 package com.canvasplus;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -30,6 +31,7 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
         switch (param.packageName) {
             case "com.oplus.pscanvas":
                 // 画布容器进程，布局问题的真正位置。
+                if (!CanvasApi.select(param.classLoader)) break;
                 CanvasLayout.install(param.classLoader);
                 Trigger.arm(param.classLoader);
                 break;

@@ -1,7 +1,24 @@
+// 一加分屏增强修改了 CanvasPlus 的此源文件。
 package com.canvasplus;
 
+import static com.canvasplus.CanvasApi.Member.*;
+
+import android.animation.ValueAnimator;
+import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.res.ColorStateList;
+import android.content.res.Configuration;
+import android.graphics.Insets;
 import android.graphics.Rect;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -21,17 +38,28 @@ import de.robv.android.xposed.XposedHelpers;
 final class CanvasLayout {
 
     private static final String TAG = "CanvasPlus";
-    private static final String POLICY_SELECTOR = "B1.n";
-    private static final String TABLET_POLICY = "B1.r";
-    private static final String CONTAINER_VIEW =
-            "com.oplus.pscanvas.canvasmode.canvas.view.ContainerView";
-    private static final String CONTAINER_ACTIVITY =
-            "com.oplus.pscanvas.canvasmode.canvas.ContainerActivity";
     private static final String FLEXIBLE_TASK_VIEW =
             "com.oplus.flexiblewindow.FlexibleTaskView";
+    private static final String PROPORTIONAL_BOUNDS = "canvasplus.proportionalBounds";
     static volatile int forcedMode = 0;
-    /** 三分屏布局方向，默认 6 = 一左两右，0 表示交给系统。 */
-    static volatile int forcedOrientation = 6;
+    static final int DEFAULT_ORIENTATION = 7;
+    /** 7 表示左边两个小窗、右边一个主窗，0 表示交给系统。 */
+    static volatile int forcedOrientation = DEFAULT_ORIENTATION;
+    private static final java.util.WeakHashMap<Object, Float> threeColumnShares =
+            new java.util.WeakHashMap<>();
+    private static final java.util.WeakHashMap<Object, Float> fourColumnShares =
+            new java.util.WeakHashMap<>();
+    private static final java.util.WeakHashMap<Object, Float> landscapeColumnShares =
+            new java.util.WeakHashMap<>();
+    private static final ThreadLocal<Float> layoutColumnShare = new ThreadLocal<>();
+    private static final ThreadLocal<int[]> layoutPaneOrder = new ThreadLocal<>();
+    private static final ThreadLocal<CanvasDisplay> layoutDisplay = new ThreadLocal<>();
+    private static final java.util.WeakHashMap<Object, List<Object>> tasksBySlot =
+            new java.util.WeakHashMap<>();
+    private static final java.util.WeakHashMap<View, MainPaneSwap> pendingMainSwaps =
+            new java.util.WeakHashMap<>();
+    private static final java.util.Set<View> swappingMainPanes =
+            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
     private static int attempts = 0;
     private static volatile boolean relayoutScheduled = false;
     private static final java.util.WeakHashMap<Object, String> layoutKeys =
@@ -44,11 +72,14 @@ final class CanvasLayout {
     /** 布局参数指纹：任务数、应用标识、taskId、bounds，用来跳过没变化的重排。 */
     private static String layoutKey(Object container) {
         try {
-            Object adapter = fieldOfType(container, "u1.c");
+            Object adapter = CanvasApi.adapter(container);
             if (adapter == null) return "";
             int count = count(adapter);
             StringBuilder sb = new StringBuilder();
             sb.append(forcedOrientation).append(':').append(count).append(':');
+            if (CanvasApi.isColorOs17() && count >= 3) {
+                sb.append(canvasArea((View) container)).append(':');
+            }
             for (int i = 0; i < count; i++) {
                 Object task = XposedHelpers.callMethod(adapter, "getItem", i);
                 if (task == null) continue;
@@ -89,7 +120,7 @@ final class CanvasLayout {
         hookFullscreen(loader);
         hookTaskInfo(loader);
         hookResume(loader);
-        lockPortrait(loader);
+        hookScreenOrientation(loader);
         hookClick(loader);
         hookDragLock(loader);
         hookOrientation(loader);
@@ -101,18 +132,23 @@ final class CanvasLayout {
         hookZoomFour(loader);
         hookFourIntents(loader);
         hookExchange(loader);
-        hookWindowMenu(loader);
+        if (CanvasApi.isColorOs17()) {
+            hookModernWindowMenu(loader);
+            hookMainPaneSwap(loader);
+        } else hookWindowMenu(loader);
         hookFourZoom(loader);
         hookTouchRegion(loader);
     }
 
     /**
-     * 键盘抬起画布后窗口顶边会跑到屏幕上方。framework 里 FlexibleTaskView 的
-     * 内边距监听要先确认整个窗口都落在屏幕内，只要有一部分出界就整段跳过，
-     * 不给画布窗口挖洞，画布于是吃掉全屏触摸，子窗口点不到。
-     * 这里在它跳过后补一次，出界的部分交集运算会自己裁掉。
+     * 系统只给完整落入画布的任务让出触摸区域。键盘位移或焦点缩放裁掉窗口边缘时，
+     * 用焦点窗的可见部分补上，让应用继续接收手势。
      */
     private static void hookTouchRegion(ClassLoader loader) {
+        if (CanvasApi.isColorOs17()) {
+            hookCanvasTouchRegion(loader);
+            return;
+        }
         try {
             Class<?> listener = XposedHelpers.findClass(
                     "com.oplus.flexiblewindow.FlexibleTaskView$FlexibleOnComputeInternalInsetsListener",
@@ -121,8 +157,6 @@ final class CanvasLayout {
                     new XC_MethodHook() {
                         @Override protected void afterHookedMethod(MethodHookParam param) {
                             try {
-                                // 只在输入法把画布抬高、窗口出界时才补挖洞。
-                                // 平时交给框架原生逻辑，别破坏放大态下点击小窗口切换的行为。
                                 if (!imeActive) return;
                                 Object view = XposedHelpers.getObjectField(
                                         param.thisObject, "this$0");
@@ -146,6 +180,59 @@ final class CanvasLayout {
         } catch (Throwable error) {
             log("touch region hook failed: " + error);
         }
+    }
+
+    private static void hookCanvasTouchRegion(ClassLoader loader) {
+        try {
+            Class<?> insets = XposedHelpers.findClass(
+                    "android.view.ViewTreeObserver$InternalInsetsInfo", loader);
+            XposedHelpers.findAndHookMethod(android.view.ViewTreeObserver.class,
+                    "dispatchOnComputeInternalInsets", insets, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                for (Object candidate : containers.keySet()) {
+                                    android.view.View canvas = (android.view.View) candidate;
+                                    if (canvas.isShown()
+                                            && canvas.getViewTreeObserver() == param.thisObject) {
+                                        allowFocusedTaskTouch(canvas, param.args[0]);
+                                        return;
+                                    }
+                                }
+                            } catch (Throwable error) {
+                                log("canvas touch region failed: " + error);
+                            }
+                        }
+                    });
+            log("canvas touch region hooked");
+        } catch (Throwable error) {
+            log("canvas touch region hook failed: " + error);
+        }
+    }
+
+    private static void allowFocusedTaskTouch(android.view.View container, Object info) {
+        Object adapter = CanvasApi.adapter(container);
+        int total = adapter == null ? 0 : count(adapter);
+        if (total < 3) return;
+        int focus = (Integer) XposedHelpers.callMethod(adapter, "h");
+        if (focus < 0 || focus >= total) return;
+        Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), focus);
+        if (decor == null) return;
+        Object taskView = XposedHelpers.callMethod(decor, "getFlexibleTaskView");
+        if (!(taskView instanceof android.view.View) || !((android.view.View) taskView).isShown()
+                || XposedHelpers.getBooleanField(taskView, "mInterceptInputEvent")
+                || XposedHelpers.getObjectField(taskView, "mTaskInfo") == null) return;
+
+        // 使用系统实际上报给应用的内容矩形，保留窗格外和分隔条的手势区。
+        Rect content = (Rect) XposedHelpers.callMethod(taskView, "calculateFrame");
+        if (!content.intersect(0, 0, container.getRootView().getWidth(),
+                container.getRootView().getHeight())) return;
+        android.graphics.Region region = (android.graphics.Region)
+                XposedHelpers.getObjectField(info, "touchableRegion");
+        if (region.isEmpty() || region.quickReject(content)) return;
+        XposedHelpers.callMethod(info, "setTouchableInsets", 3);
+        region.op(content, android.graphics.Region.Op.DIFFERENCE);
+        Object listener = XposedHelpers.getObjectField(taskView, "mListener");
+        if (listener != null) XposedHelpers.callMethod(listener, "updateTouchRegion", region);
     }
 
     /**
@@ -178,18 +265,19 @@ final class CanvasLayout {
     /** 用户从这个菜单缩小过。只有这种状态下点击窗口才不放大。 */
     private static final java.util.WeakHashMap<Object, Boolean> menuShrunk =
             new java.util.WeakHashMap<>();
+    private static final java.util.Set<Object> focusing =
+            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
+    private static final java.util.WeakHashMap<Object, Integer> enlargedPanes =
+            new java.util.WeakHashMap<>();
+    private static final java.util.WeakHashMap<Object, java.lang.ref.WeakReference<android.animation.Animator>> zoomAnimations =
+            new java.util.WeakHashMap<>();
 
-    /** 设置项：缩小后点击窗口不放大。用 LSPosed 的 XSharedPreferences 读模块设置。 */
-    private static boolean noClickZoom() {
-        try {
-            de.robv.android.xposed.XSharedPreferences prefs =
-                    new de.robv.android.xposed.XSharedPreferences(
-                            "com.canvasplus", Settings.PREFS);
-            if (!prefs.getFile().canRead()) return false;
-            prefs.reload();
-            return prefs.getBoolean(Settings.NO_CLICK_ZOOM, true);
-        } catch (Throwable ignored) {
-            return false;
+    private static void markEnlarged(Object adapter, int total, int focus) {
+        for (int index = 0; index < total; index++) {
+            Object task = XposedHelpers.callMethod(adapter, "getItem", index);
+            if (task != null) {
+                XposedHelpers.callMethod(task, TASK_ENLARGED.value(), index == focus);
+            }
         }
     }
 
@@ -207,11 +295,17 @@ final class CanvasLayout {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
                         Object container = param.args[0];
-                        Object adapter = fieldOfType(container, "u1.c");
+                        Object adapter = CanvasApi.adapter(container);
                         if (adapter == null) return;
                         int total = count(adapter);
                         if (total < 3) return;
                         boolean enlarge = (Boolean) param.args[2];
+                        if (CanvasApi.isColorOs17()) {
+                            int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition", param.args[1]);
+                            if (index >= 0) changeZoom((View) container, adapter, index, enlarge);
+                            param.setResult(null);
+                            return;
+                        }
                         if (enlarge) {
                             menuShrunk.remove(container);
                             fourZoomed.put(container, Boolean.TRUE);
@@ -221,24 +315,12 @@ final class CanvasLayout {
                             if (position instanceof Integer && (Integer) position >= 0) {
                                 focus = (Integer) position;
                             }
-                            for (int i = 0; i < total; i++) {
-                                Object task = XposedHelpers.callMethod(
-                                        adapter, "getItem", i);
-                                if (task != null) {
-                                    XposedHelpers.callMethod(task, "p0", i == focus);
-                                }
-                            }
+                            markEnlarged(adapter, total, focus);
                             zoomFourFocus(container, adapter, param.args[1]);
                         } else {
                             menuShrunk.put(container, Boolean.TRUE);
                             fourZoomed.put(container, Boolean.FALSE);
-                            for (int i = 0; i < total; i++) {
-                                Object task = XposedHelpers.callMethod(
-                                        adapter, "getItem", i);
-                                if (task != null) {
-                                    XposedHelpers.callMethod(task, "p0", false);
-                                }
-                            }
+                            markEnlarged(adapter, total, -1);
                             if (total == 4) fitFour(container, 450);
                             else fitThree(container, 450);
                         }
@@ -255,6 +337,364 @@ final class CanvasLayout {
         }
     }
 
+    private static void changeZoom(View canvas, Object adapter, int index, boolean enlarge) {
+        if (!(canvas.getParent() instanceof View parent) || !focusing.add(canvas)) return;
+        try {
+            int panes = count(adapter);
+            Object value = XposedHelpers.callMethod(canvas, "getRectList");
+            if (!(value instanceof java.util.List<?> rects) || rects.size() != panes
+                    || index < 0 || index >= panes) return;
+            Rect bounds = enlarge ? (Rect) rects.get(index) : contentRect(canvas);
+            if (bounds == null || bounds.isEmpty()) return;
+            Rect area = canvasArea(canvas);
+            boolean landscape = isLandscape(canvas);
+            int margin = landscape ? 0 : marginPx();
+            boolean alignTop = !landscape && !enlarge && panes == 4;
+            float top = area.top + (alignTop ? 0 : margin);
+            float height = area.bottom - top - margin;
+            float scale = Math.min((float) area.width() / bounds.width(), height / bounds.height());
+            if (!enlarge) scale = Math.min(1f, scale);
+            if (scale <= 0f) return;
+            float x = Math.round(overviewX(canvas, area, bounds, scale));
+            float y = Math.round(overviewY(canvas, bounds, scale, top, height, alignTop));
+            if (enlarge && Integer.valueOf(index).equals(enlargedPanes.get(canvas))
+                    && (isZoomAnimating(canvas) || (Math.abs(parent.getScaleX() - scale) < 0.0001f
+                            && Math.abs(parent.getTranslationX() - x) <= 1f
+                            && Math.abs(parent.getTranslationY() - y) <= 1f))) return;
+            if (enlarge) enlargedPanes.put(canvas, index);
+            else enlargedPanes.remove(canvas);
+            fourZoomed.put(canvas, enlarge);
+            XposedHelpers.callMethod(adapter, "I", index);
+            markEnlarged(adapter, panes, enlarge ? index : -1);
+            setAutoTarget(canvas, x, y, scale);
+            if (Boolean.TRUE.equals(XposedHelpers.callMethod(canvas, ANIMATE_SCALE.value(),
+                    x, y, scale, 240, 0))) {
+                android.animation.Animator animation = (android.animation.Animator)
+                        XposedHelpers.callMethod(canvas, "getAnimatorSet");
+                zoomAnimations.put(canvas, new java.lang.ref.WeakReference<>(animation));
+            }
+            log("window zoom " + (enlarge ? "in" : "out") + " pane=" + index
+                    + " scale=" + scale + " x=" + x + " y=" + y);
+        } finally {
+            focusing.remove(canvas);
+        }
+    }
+
+    private static boolean isZoomAnimating(View canvas) {
+        java.lang.ref.WeakReference<android.animation.Animator> reference = zoomAnimations.get(canvas);
+        android.animation.Animator animation = reference == null ? null : reference.get();
+        return animation != null && animation.isStarted();
+    }
+
+    private static void cancelZoom(Object canvas) {
+        java.lang.ref.WeakReference<android.animation.Animator> reference = zoomAnimations.remove(canvas);
+        android.animation.Animator animation = reference == null ? null : reference.get();
+        if (animation != null && animation.isStarted()) animation.cancel();
+    }
+
+    private static final int MAIN_WINDOW_ACTION = 1025;
+    private static final int AUTO_MAIN_WINDOW_ACTION = 1026;
+    private static final String AUTO_MAIN_WINDOW = "auto_main_window";
+
+    private static boolean autoMainWindow(Context context) {
+        return context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
+                .getBoolean(AUTO_MAIN_WINDOW, false);
+    }
+
+    private static void hookModernWindowMenu(ClassLoader loader) {
+        try {
+            Class<?> header = XposedHelpers.findClass(CanvasApi.PACKAGE + "v", loader);
+            Class<?> builder = XposedHelpers.findClass("com.coui.appcompat.poplist.L$a", loader);
+            Class<?> strings = XposedHelpers.findClass("com.oplus.pscanvas.j", loader);
+            int enlargeText = XposedHelpers.getStaticIntField(strings, "W");
+            int shrinkText = XposedHelpers.getStaticIntField(strings, "X");
+            XposedHelpers.findAndHookMethod(header, "U0", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    Object owner = param.thisObject;
+                    View canvas = (View) XposedHelpers.getObjectField(owner, "n");
+                    Object adapter = CanvasApi.adapter(canvas);
+                    if (adapter == null || count(adapter) < 3) return;
+                    int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition",
+                            XposedHelpers.getObjectField(owner, "o"));
+                    if (index < 0) return;
+                    java.util.List<Object> items = (java.util.List<Object>) XposedHelpers.getObjectField(owner, "X");
+                    String enlarge = canvas.getResources().getString(enlargeText);
+                    String shrink = canvas.getResources().getString(shrinkText);
+                    items.removeIf(item -> {
+                        Object title = XposedHelpers.callMethod(item, "t");
+                        return enlarge.equals(title) || shrink.equals(title);
+                    });
+                    boolean enlarged = Integer.valueOf(index).equals(enlargedPanes.get(canvas));
+                    items.add(0, windowMenuItem(builder, enlarged ? shrink : enlarge, 0,
+                            android.R.drawable.ic_menu_zoom));
+                    int main = mainPane(canvas, adapter);
+                    if (main >= 0) {
+                        items.add(1, autoMainMenuItem(builder, canvas.getContext(),
+                                autoMainWindow(canvas.getContext())));
+                    }
+                    if (main >= 0 && main != index) {
+                        items.add(2, windowMenuItem(builder, "设为主窗口", MAIN_WINDOW_ACTION,
+                                android.R.drawable.btn_star_big_off));
+                    }
+                }
+            });
+            XposedHelpers.findAndHookMethod(CanvasApi.PACKAGE + "v$d", loader, "onItemClick",
+                    android.widget.AdapterView.class, View.class, int.class, long.class,
+                    new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            Object owner = XposedHelpers.getObjectField(param.thisObject, "c");
+                            List<?> items = (List<?>) XposedHelpers.getObjectField(owner, "X");
+                            int row = (Integer) param.args[2];
+                            if (row < 0 || row >= items.size()) return;
+                            int action = (Integer) XposedHelpers.callMethod(items.get(row), "m");
+                            if (action != MAIN_WINDOW_ACTION && action != AUTO_MAIN_WINDOW_ACTION) return;
+                            param.setResult(null);
+                            View canvas = (View) XposedHelpers.getObjectField(owner, "n");
+                            Object task = XposedHelpers.getObjectField(owner, "o");
+                            Object adapter = CanvasApi.adapter(canvas);
+                            if (adapter == null || mainPane(canvas, adapter) < 0) return;
+                            android.widget.PopupWindow popup = (android.widget.PopupWindow)
+                                    XposedHelpers.getObjectField(owner, "p");
+                            if (action == AUTO_MAIN_WINDOW_ACTION) {
+                                Context context = canvas.getContext();
+                                boolean enabled = !autoMainWindow(context);
+                                context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit()
+                                        .putBoolean(AUTO_MAIN_WINDOW, enabled).apply();
+                                popup.dismiss();
+                                log("auto main window " + (enabled ? "on" : "off"));
+                                return;
+                            }
+                            popup.dismiss();
+                            int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition", task);
+                            if (index >= 0) selectMainPane(canvas, adapter, index);
+                        }
+                    });
+            log("modern window menu hooked");
+        } catch (Throwable error) {
+            log("modern window menu failed: " + error);
+        }
+    }
+
+    private static Object windowMenuItem(Class<?> type, String label, int id, int icon) {
+        return XposedHelpers.callMethod(windowMenuBuilder(type, label, id, icon), "y");
+    }
+
+    private static Object windowMenuBuilder(Class<?> type, String label, int id, int icon) {
+        Object builder = XposedHelpers.newInstance(type);
+        XposedHelpers.callMethod(builder, "D", icon);
+        XposedHelpers.callMethod(builder, "E", id);
+        XposedHelpers.callMethod(builder, "J", label);
+        XposedHelpers.callMethod(builder, "G", true);
+        return builder;
+    }
+
+    private static Object autoMainMenuItem(Class<?> type, Context context, boolean enabled) {
+        int uiMode = context.getResources().getConfiguration().uiMode;
+        boolean dark = (uiMode & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+                == android.content.res.Configuration.UI_MODE_NIGHT_YES;
+        int color = enabled ? (dark ? 0xfff5f5f5 : 0xff000000)
+                : (dark ? 0xffa7a7a7 : 0xff808080);
+        Object builder = windowMenuBuilder(type, "自动切换主屏", AUTO_MAIN_WINDOW_ACTION, 0);
+        XposedHelpers.setObjectField(builder, "m", ColorStateList.valueOf(color));
+        android.graphics.drawable.Drawable icon = context.getDrawable(android.R.drawable.ic_menu_rotate);
+        if (icon != null) {
+            icon = icon.mutate();
+            icon.setTint(color);
+            XposedHelpers.callMethod(builder, "C", icon);
+            XposedHelpers.setIntField(builder, "f", XposedHelpers.getIntField(builder, "f") & ~1);
+        }
+        return XposedHelpers.callMethod(builder, "y");
+    }
+
+    private static int mainPane(Object canvas, Object adapter) {
+        int slot = CanvasGeometry.mainPane(count(adapter), mainPaneMode((View) canvas, adapter));
+        if (slot < 0) return slot;
+        return (Integer) XposedHelpers.callMethod(adapter, "getPosition", paneOrder(canvas, adapter).get(slot));
+    }
+
+    private static int mainPaneMode(View canvas, Object adapter) {
+        return isLandscape(canvas) ? DEFAULT_ORIENTATION : layoutMode(adapter);
+    }
+
+    private static List<Object> paneOrder(Object canvas, Object adapter) {
+        int count = count(adapter);
+        List<Object> current = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            current.add(XposedHelpers.callMethod(adapter, "getItem", index));
+        }
+        List<Object> saved = tasksBySlot.get(canvas);
+        if (saved != null && saved.size() == count && current.containsAll(saved)) return saved;
+        tasksBySlot.put(canvas, current);
+        return current;
+    }
+
+    private static int[] panePositions(Object canvas, Object adapter) {
+        List<Object> tasks = paneOrder(canvas, adapter);
+        int[] result = new int[tasks.size()];
+        for (int slot = 0; slot < tasks.size(); slot++) {
+            int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition", tasks.get(slot));
+            if (index < 0 || index >= tasks.size()) return null;
+            result[index] = slot;
+        }
+        return result;
+    }
+
+    private static boolean selectMainPane(View canvas, Object adapter, int index) {
+        if (pendingMainSwaps.containsKey(canvas) || swappingMainPanes.contains(canvas)) return false;
+        int main = mainPane(canvas, adapter);
+        if (main < 0 || main == index) return false;
+        List<Object> slots = paneOrder(canvas, adapter);
+        Object task = XposedHelpers.callMethod(adapter, "getItem", index);
+        int slot = slots.indexOf(task);
+        boolean overview = !isFourZoomed(canvas) && !isZoomAnimating(canvas);
+        View selected = (View) XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), index);
+        View previous = (View) XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), main);
+        if (!CanvasGeometry.swapMainPane(slots, mainPaneMode(canvas, adapter), slot)) return false;
+        cancelZoom(canvas);
+        if (overview && selected != null && previous != null) {
+            pendingMainSwaps.put(canvas, new MainPaneSwap(
+                    new PaneMotion(selected), new PaneMotion(previous)));
+        }
+        enlargedPanes.remove(canvas);
+        fourZoomed.remove(canvas);
+        XposedHelpers.callMethod(adapter, "I", index);
+        markEnlarged(adapter, count(adapter), -1);
+        layoutKeys.remove(canvas);
+        canvas.requestLayout();
+        log("main pane selected index=" + index + " previous=" + main);
+        return true;
+    }
+
+    private static void hookMainPaneSwap(ClassLoader loader) {
+        try {
+            Class<?> gestures = XposedHelpers.findClass(CanvasApi.PACKAGE + "A", loader);
+            XposedHelpers.findAndHookMethod(gestures, "M", MotionEvent.class, new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    MotionEvent touch = (MotionEvent) param.args[0];
+                    if (touch.getActionMasked() != MotionEvent.ACTION_DOWN
+                            || touch.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) return;
+                    View canvas = (View) XposedHelpers.getObjectField(param.thisObject, "h");
+                    Object adapter = CanvasApi.adapter(canvas);
+                    if (adapter == null || CanvasGeometry.mainPane(count(adapter), mainPaneMode(canvas, adapter)) < 0
+                            || !autoMainWindow(canvas.getContext()) || isFourZoomed(canvas)
+                            || XposedHelpers.getBooleanField(canvas, "T")) return;
+                    int index = XposedHelpers.getIntField(param.thisObject, "o");
+                    if (index < 0 || index >= count(adapter) || index == mainPane(canvas, adapter)) return;
+                    int x = (int) touch.getRawX();
+                    int y = (int) touch.getRawY();
+                    Object popup = XposedHelpers.getObjectField(canvas, "W");
+                    if (popup instanceof android.widget.PopupWindow menu && menu.isShowing()) return;
+                    int hit = (Integer) XposedHelpers.callMethod(canvas, "k0",
+                            x, y);
+                    if (index != hit) return;
+                    Object decor = XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), index);
+                    if (decor == null) return;
+                    Object taskView = XposedHelpers.callMethod(decor, "getFlexibleTaskView");
+                    if (taskView == null) return;
+                    XposedHelpers.callMethod(taskView, "calculateFrame");
+                    Rect header = (Rect) XposedHelpers.callMethod(taskView, "calculateHandleFrame");
+                    if (header.contains(x, y) || !selectMainPane(canvas, adapter, index)) return;
+                    // 手指落下时已换窗，后续的同一笔触交给画布结束。
+                    Object activity = XposedHelpers.getObjectField(param.thisObject, "b");
+                    XposedHelpers.callMethod(activity, "O1");
+                    XposedHelpers.setIntField(param.thisObject, "o", -2);
+                    log("auto main window selected on touch down index=" + index);
+                }
+            });
+            Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+            XposedHelpers.findAndHookMethod(view, "onLayout", boolean.class,
+                    int.class, int.class, int.class, int.class, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            View canvas = (View) param.thisObject;
+                            MainPaneSwap swap = pendingMainSwaps.remove(canvas);
+                            if (swap != null) swap.start(canvas);
+                        }
+                    });
+            log("automatic main window hooked");
+        } catch (Throwable error) {
+            log("automatic main window hook failed: " + error);
+        }
+    }
+
+    private record MainPaneSwap(PaneMotion selected, PaneMotion previous) {
+        void start(View canvas) {
+            if (!selected.prepare(canvas) || !previous.prepare(canvas)) return;
+            swappingMainPanes.add(canvas);
+            selected.apply(0f);
+            previous.apply(0f);
+            ValueAnimator animation = ValueAnimator.ofFloat(0f, 1f);
+            animation.setDuration(260);
+            animation.setInterpolator(new android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f));
+            animation.addUpdateListener(animator -> {
+                float progress = (Float) animator.getAnimatedValue();
+                selected.apply(progress);
+                previous.apply(progress);
+            });
+            animation.addListener(new android.animation.AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(android.animation.Animator animator) {
+                    selected.reset();
+                    previous.reset();
+                    swappingMainPanes.remove(canvas);
+                    if (canvas.isAttachedToWindow()) {
+                        XposedHelpers.callMethod(canvas, "z2");
+                        XposedHelpers.callMethod(canvas, "v2");
+                        log("main pane swap animation finished");
+                    }
+                }
+            });
+            animation.start();
+        }
+    }
+
+    private static final class PaneMotion {
+        private final View pane;
+        private final Rect start;
+        private Rect end;
+        private final boolean pivotSet;
+        private final float pivotX;
+        private final float pivotY;
+
+        PaneMotion(View pane) {
+            this.pane = pane;
+            start = bounds(pane);
+            pivotSet = pane.isPivotSet();
+            pivotX = pane.getPivotX();
+            pivotY = pane.getPivotY();
+        }
+
+        private static Rect bounds(View view) {
+            return new Rect(view.getLeft(), view.getTop(), view.getRight(), view.getBottom());
+        }
+
+        boolean prepare(View canvas) {
+            end = bounds(pane);
+            return pane.getParent() == canvas && !start.isEmpty() && !end.isEmpty() && !start.equals(end);
+        }
+
+        void apply(float progress) {
+            float remaining = 1f - progress;
+            // 从交换前的窗格边缘移动到交换后的边缘。
+            float scaleX = 1f + ((float) start.width() / end.width() - 1f) * remaining;
+            float scaleY = 1f + ((float) start.height() / end.height() - 1f) * remaining;
+            pane.setPivotX(0f);
+            pane.setPivotY(0f);
+            pane.setScaleX(scaleX);
+            pane.setScaleY(scaleY);
+            pane.setTranslationX((start.left - end.left) * remaining);
+            pane.setTranslationY((start.top - end.top) * remaining);
+        }
+
+        void reset() {
+            apply(1f);
+            if (pivotSet) {
+                pane.setPivotX(pivotX);
+                pane.setPivotY(pivotY);
+            } else {
+                pane.resetPivot();
+            }
+        }
+    }
+
     /** 把焦点窗口缩放到铺满屏幕。 */
     private static void zoomFourFocus(Object container, Object adapter, Object task) {
         try {
@@ -263,11 +703,11 @@ final class CanvasLayout {
             if (position instanceof Integer && (Integer) position >= 0) {
                 focus = (Integer) position;
             }
-            Object rects = XposedHelpers.getObjectField(container, "l");
+            Object rects = XposedHelpers.callMethod(container, "getRectList");
             android.content.Context context = ((android.view.View) container).getContext();
             Object list = XposedHelpers.callStaticMethod(
-                    XposedHelpers.findClass("B1.l", container.getClass().getClassLoader()),
-                    "a0", context, rects,
+                    XposedHelpers.findClass(UTIL.value(), container.getClass().getClassLoader()),
+                    SCALE_TARGET.value(), context, rects,
                     XposedHelpers.callMethod(adapter, "n"),
                     XposedHelpers.callMethod(adapter, "v"),
                     focus);
@@ -281,7 +721,7 @@ final class CanvasLayout {
             float ty = XposedHelpers.getFloatField(last, "top");
             float scale = XposedHelpers.getFloatField(last, "right");
             XposedHelpers.callMethod(adapter, "I", focus);
-            XposedHelpers.callMethod(container, "A2", tx, ty, scale, 450, 0);
+            XposedHelpers.callMethod(container, ANIMATE_SCALE.value(), tx, ty, scale, 450, 0);
         } catch (Throwable error) {
             log("four zoom focus failed: " + error);
         }
@@ -290,7 +730,7 @@ final class CanvasLayout {
     /** 画布内容的整体矩形。 */
     private static Rect contentRect(Object container) {
         try {
-            Object rects = XposedHelpers.getObjectField(container, "l");
+            Object rects = XposedHelpers.callMethod(container, "getRectList");
             if (!(rects instanceof java.util.List)) return null;
             Rect union = new Rect();
             boolean any = false;
@@ -313,7 +753,7 @@ final class CanvasLayout {
         try {
             Object focus = XposedHelpers.callMethod(adapter, "h");
             if (!(focus instanceof Integer)) return Float.NaN;
-            Object rects = XposedHelpers.getObjectField(container, "l");
+            Object rects = XposedHelpers.callMethod(container, "getRectList");
             if (!(rects instanceof java.util.List)) return Float.NaN;
             java.util.List<?> list = (java.util.List<?>) rects;
             int index = (Integer) focus;
@@ -347,21 +787,17 @@ final class CanvasLayout {
     private static void shiftForIme(XC_MethodHook.MethodHookParam param) {
         try {
             int ime = (Integer) param.args[0];
-            Object view = XposedHelpers.callMethod(param.thisObject, "x0");
+            Object view = XposedHelpers.callMethod(param.thisObject, ACTIVITY_VIEW.value());
             if (view == null) return;
-            // 二窗是系统原生分屏，键盘完全交给系统，这里一点都别碰
-            Object adapter = fieldOfType(view, "u1.c");
-            if (adapter == null || count(adapter) < 3) {
-                imeActive = false;
-                return;
-            }
             Float base = layoutTy.get(view);
             if (base == null) return;
             android.view.View parent = (android.view.View)
                     ((android.view.View) view).getParent();
             if (parent == null) return;
             int shift = 0;
-            if (ime > 200) {
+            // 二窗是系统原生分屏，键盘交给系统自己处理，这里只增强三窗和四窗
+            Object adapter = CanvasApi.adapter(view);
+            if (ime > 200 && adapter != null && count(adapter) >= 3) {
                 shift = coveredByIme(view, parent, base, ime);
                 if (shift < 0) shift = ime;
                 shift = Math.min(shift, ime);
@@ -391,11 +827,11 @@ final class CanvasLayout {
      */
     private static void moveFocusTask(Object container, int shift, int ime) {
         try {
-            Object adapter = fieldOfType(container, "u1.c");
+            Object adapter = CanvasApi.adapter(container);
             if (adapter == null) return;
             Object focus = XposedHelpers.callMethod(adapter, "h");
             int index = focus instanceof Integer ? (Integer) focus : 0;
-            Object decor = XposedHelpers.callMethod(container, "q0", index);
+            Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), index);
             if (decor == null) return;
             Object taskView = XposedHelpers.callMethod(decor, "getFlexibleTaskView");
             if (taskView == null) return;
@@ -441,14 +877,14 @@ final class CanvasLayout {
     private static int coveredByIme(Object container, android.view.View parent,
                                     float base, int ime) {
         try {
-            Object adapter = fieldOfType(container, "u1.c");
+            Object adapter = CanvasApi.adapter(container);
             if (adapter == null) return -1;
             int total = count(adapter);
             if (total < 2) return -1;
             Object focus = XposedHelpers.callMethod(adapter, "h");
             int index = focus instanceof Integer ? (Integer) focus : 0;
             if (index < 0 || index >= total) index = 0;
-            Object decor = XposedHelpers.callMethod(container, "q0", index);
+            Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), index);
             if (decor == null) return -1;
             Object taskView = XposedHelpers.callMethod(decor, "getFlexibleTaskView");
             if (!(taskView instanceof android.view.View)) return -1;
@@ -466,36 +902,51 @@ final class CanvasLayout {
 
     /** 画布上下留的边距。 */
     private static int marginPx() {
-        return Math.round(20f * android.content.res.Resources
+        float margin = CanvasApi.isColorOs17() ? 4f : 20f;
+        return Math.round(margin * android.content.res.Resources
                 .getSystem().getDisplayMetrics().density);
     }
 
     /** 三窗总览：内容整体缩放到可用区域。 */
     private static void fitThree(Object container, int duration) {
+        fitOverview(container, duration, 3);
+    }
+
+    private static void fitOverview(Object container, int duration, int panes) {
         try {
-            Object adapter = fieldOfType(container, "u1.c");
-            if (adapter == null || count(adapter) != 3) return;
+            Object adapter = CanvasApi.adapter(container);
+            if (adapter == null || count(adapter) != panes) return;
             Rect union = contentRect(container);
             if (union == null) return;
             android.view.View view = (android.view.View) container;
             android.view.View parent = (android.view.View) view.getParent();
             if (parent == null) return;
-            float avail = parent.getHeight() - statusBarHeight() - marginPx() * 2f;
-            float scale = Math.min((float) parent.getWidth() / union.width(),
-                    avail / union.height());
-            if (scale <= 0f || scale > 1f) return;
+            float scale = overviewScale(parent.getWidth(), union,
+                    parent.getHeight() - statusBarHeight() - marginPx() * 2f);
+            if (scale <= 0f) return;
             // 平移量由 A2 的 hook 统一算
-            XposedHelpers.callMethod(container, "A2", 0f, 0f, scale, duration, 0);
-            log("three fit scale=" + scale);
+            XposedHelpers.callMethod(container, ANIMATE_SCALE.value(),
+                    0f, 0f, scale, duration, 0);
+            log("fit " + panes + " windows scale=" + scale);
         } catch (Throwable error) {
-            log("three fit failed: " + error);
+            log("fit " + panes + " windows failed: " + error);
         }
+    }
+
+    private static float overviewScale(int width, Rect union, float availableHeight) {
+        if (union.isEmpty()) return 0f;
+        return Math.min(1f, Math.min((float) width / union.width(),
+                availableHeight / union.height()));
     }
 
     /** 四等分：画布缩放到 2×2 总尺寸正好放进屏幕。 */
     private static void fitFour(Object container, int duration) {
+        if (CanvasApi.isColorOs17()) {
+            fitOverview(container, duration, 4);
+            return;
+        }
         try {
-            Object adapter = fieldOfType(container, "u1.c");
+            Object adapter = CanvasApi.adapter(container);
             if (adapter == null || count(adapter) != 4) return;
             Rect cell = phoneSize();
             int gap = Math.round(10f * android.content.res.Resources
@@ -510,10 +961,57 @@ final class CanvasLayout {
                     avail / (2 * cell.height() + gap));
             if (fit <= 0f || fit > 1f) return;
             // 平移量交给 A2 的 hook 统一算
-            XposedHelpers.callMethod(container, "A2", 0f, 0f, fit, duration, 4);
+            XposedHelpers.callMethod(container, ANIMATE_SCALE.value(), 0f, 0f, fit, duration, 4);
         } catch (Throwable error) {
             log("four fit failed: " + error);
         }
+    }
+
+    private static float overviewX(View canvas, Rect area, Rect union, float scale) {
+        return area.left + (area.width() - union.width() * scale) / 2f
+                - (canvas.getLeft() + union.left) * scale;
+    }
+
+    private static float overviewY(View canvas, Rect union, float scale,
+                                   float topInset, float availableHeight, boolean alignTop) {
+        float top = alignTop ? topInset : topInset + (availableHeight - union.height() * scale) / 2f;
+        return top
+                - (canvas.getTop() + union.top) * scale;
+    }
+
+    /** 在同一次布局里提交窗格和画布坐标，避免新窗格先用上一套平移量画一帧。 */
+    private static void applyOverview(View canvas, int panes) {
+        if (!(canvas.getParent() instanceof View parent)) return;
+        Rect union = contentRect(canvas);
+        if (union == null) return;
+        Rect area = canvasArea(canvas);
+        boolean landscape = isLandscape(canvas);
+        int margin = landscape ? 0 : marginPx();
+        boolean alignTop = !landscape && panes == 4;
+        float topInset = area.top + (alignTop ? 0 : margin);
+        float availableHeight = area.bottom - topInset - margin;
+        float scale = overviewScale(area.width(), union, availableHeight);
+        if (scale <= 0f) return;
+        float x = Math.round(overviewX(canvas, area, union, scale));
+        float y = Math.round(overviewY(canvas, union, scale, topInset, availableHeight, alignTop));
+        setAutoTarget(canvas, x, y, scale);
+
+        android.view.WindowInsets insets = canvas.getRootWindowInsets();
+        boolean keyboardVisible = insets != null && insets.isVisible(android.view.WindowInsets.Type.ime());
+        if (!keyboardVisible && parent.getTranslationY() != y) parent.setTranslationY(y);
+        if (parent.getTranslationX() != x) parent.setTranslationX(x);
+        if (parent.getScaleX() != scale) parent.setScaleX(scale);
+        if (parent.getScaleY() != scale) parent.setScaleY(scale);
+        XposedHelpers.setFloatField(canvas, "A0", x);
+        XposedHelpers.setFloatField(canvas, "B0", parent.getTranslationY());
+        XposedHelpers.setFloatField(canvas, "C0", scale);
+        XposedHelpers.callMethod(canvas, "setNeedUpdateFlexibleTaskViewFrameFlag", true);
+    }
+
+    private static void setAutoTarget(View canvas, float x, float y, float scale) {
+        XposedHelpers.setFloatField(canvas, "o0", x);
+        XposedHelpers.setFloatField(canvas, "p0", y);
+        XposedHelpers.setFloatField(canvas, "q0", scale);
     }
 
     /**
@@ -523,20 +1021,20 @@ final class CanvasLayout {
      */
     private static void hookExchange(ClassLoader loader) {
         try {
-            Class<?> container = XposedHelpers.findClass(CONTAINER_VIEW, loader);
+            Class<?> container = XposedHelpers.findClass(CanvasApi.VIEW, loader);
             Class<?> barItem = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.E$c", loader);
-            XposedHelpers.findAndHookMethod(container, "k0", barItem, new XC_MethodHook() {
+                    SPLIT_BAR_ITEM.value(), loader);
+            XposedHelpers.findAndHookMethod(container, EXCHANGE_TASKS.value(), barItem, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
                         Object self = param.thisObject;
-                        Object rects = XposedHelpers.getObjectField(self, "l");
+                        Object rects = XposedHelpers.callMethod(self, "getRectList");
                         int want = rects instanceof java.util.List
                                 ? ((java.util.List<?>) rects).size() : 0;
                         int have = embeddedCount(self);
                         if (have < want) {
                             log("exchange fill views " + have + "/" + want);
-                            XposedHelpers.callMethod(self, "T2");
+                            XposedHelpers.callMethod(self, PREPARE_VIEWS.value());
                             have = embeddedCount(self);
                         }
                         if (have < want) {
@@ -619,12 +1117,12 @@ final class CanvasLayout {
     private static void hookZoomFour(ClassLoader loader) {
         try {
             final Class<?> zoom = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.I", loader);
-            final Class<?> taskData = XposedHelpers.findClass("u1.d", loader);
+                    TO_FLOATING.value(), loader);
+            final Class<?> taskData = XposedHelpers.findClass(TASK.value(), loader);
             final Class<?> taskView = XposedHelpers.findClass(
                     "com.oplus.flexiblewindow.FlexibleTaskView", loader);
             final Class<?> animClass = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.I$j", loader);
+                    TO_FLOATING.value() + "$j", loader);
             java.lang.reflect.Constructor<?> ctor = null;
             try {
                 ctor = animClass.getDeclaredConstructor(
@@ -635,7 +1133,7 @@ final class CanvasLayout {
             }
             final java.lang.reflect.Constructor<?> animCtor = ctor;
 
-            XposedHelpers.findAndHookMethod(zoom, "n0", int.class, int.class,
+            XposedHelpers.findAndHookMethod(zoom, FLOATING_CAN_ANIMATE.value(), int.class, int.class,
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
                             try {
@@ -655,7 +1153,7 @@ final class CanvasLayout {
 
             // i0/k0 在同类里会被 ART 内联，hook 不到，改在最外层 y0 改参数：
             // 四窗按三窗动画流程走，焦点在 3 时正好对上。
-            XposedHelpers.findAndHookMethod(zoom, "y0", int.class, int.class,
+            if (!CanvasApi.isColorOs17()) XposedHelpers.findAndHookMethod(zoom, "y0", int.class, int.class,
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
                             try {
@@ -672,7 +1170,7 @@ final class CanvasLayout {
                         }
                     });
 
-            XposedHelpers.findAndHookMethod(zoom, "i0", int.class, int.class,
+            XposedHelpers.findAndHookMethod(zoom, FLOATING_START_RECTS.value(), int.class, int.class,
                     new XC_MethodHook() {
                         @Override protected void afterHookedMethod(MethodHookParam param) {
                             try {
@@ -691,8 +1189,8 @@ final class CanvasLayout {
                                         rects.add(new Rect());
                                         continue;
                                     }
-                                    Object decor = XposedHelpers.callMethod(container, "q0", i);
-                                    Object rect = XposedHelpers.callMethod(self, "h0", decor);
+                                    Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), i);
+                                    Object rect = XposedHelpers.callMethod(self, FLOATING_SOURCE_RECT.value(), decor);
                                     log("i0 rect[" + i + "]=" + rect);
                                     if (!(rect instanceof Rect)
                                             || ((Rect) rect).width() <= 0
@@ -706,7 +1204,7 @@ final class CanvasLayout {
                         }
                     });
 
-            XposedHelpers.findAndHookMethod(zoom, "k0", java.util.List.class,
+            XposedHelpers.findAndHookMethod(zoom, FLOATING_ANIMATION.value(), java.util.List.class,
                     int.class, int.class, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
                             try {
@@ -729,10 +1227,10 @@ final class CanvasLayout {
                                         rest.add(XposedHelpers.callMethod(controller, "l", i));
                                     }
                                 }
-                                XposedHelpers.callMethod(container, "e3", context, rest, 0);
+                                XposedHelpers.callMethod(container, REFRESH_TASK_DATA.value(), context, rest, 0);
                                 Object computed = XposedHelpers.callStaticMethod(
-                                        XposedHelpers.findClass("B1.l", appLoader),
-                                        "c1", context, rest, 0, false);
+                                        XposedHelpers.findClass(UTIL.value(), appLoader),
+                                        CALCULATE_RECTS.value(), context, rest, 0, false);
                                 if (!(computed instanceof java.util.List)
                                         || ((java.util.List<?>) computed).size() != 3) {
                                     param.setResult(Boolean.FALSE);
@@ -743,12 +1241,12 @@ final class CanvasLayout {
                                 targets.add(focus, new Rect());
                                 Object sources = XposedHelpers.getObjectField(self, "O");
                                 for (int i = 0; i < 4; i++) {
-                                    if (!(Boolean) XposedHelpers.callMethod(self, "n0", i, 4)) {
+                                    if (!(Boolean) XposedHelpers.callMethod(self, FLOATING_CAN_ANIMATE.value(), i, 4)) {
                                         param.setResult(Boolean.FALSE);
                                         return;
                                     }
                                     if (i == focus) continue;
-                                    Object decor = XposedHelpers.callMethod(container, "q0", i);
+                                    Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), i);
                                     Object view = XposedHelpers.callMethod(
                                             decor, "getFlexibleTaskView");
                                     Object anim = animCtor.newInstance(
@@ -781,7 +1279,7 @@ final class CanvasLayout {
      */
     private static void hookLayoutCalc(ClassLoader loader) {
         try {
-            Class<?> util = XposedHelpers.findClass("B1.l", loader);
+            Class<?> util = XposedHelpers.findClass(UTIL.value(), loader);
             XposedHelpers.findAndHookMethod(util, "M",
                     android.content.Context.class, java.util.List.class,
                     int.class, int.class, int.class, boolean.class,
@@ -792,21 +1290,10 @@ final class CanvasLayout {
                                 Object input = param.args[1];
                                 if (!(input instanceof java.util.List)) return;
                                 java.util.List<?> list = (java.util.List<?>) input;
-                                if (list.size() < 4) return;
+                                if (list.size() != 4) return;
                                 if (result instanceof java.util.List
                                         && !((java.util.List<?>) result).isEmpty()) return;
-                                Rect cell = phoneSize();
-                                int gap = Math.round(10f * android.content.res.Resources
-                                        .getSystem().getDisplayMetrics().density);
-                                int w = cell.width();
-                                int h = cell.height();
-                                java.util.List<Rect> rects = new java.util.ArrayList<>();
-                                for (int i = 0; i < list.size(); i++) {
-                                    int left = (i % 2) * (w + gap);
-                                    int top = (i / 2) * (h + gap);
-                                    rects.add(new Rect(left, top, left + w, top + h));
-                                }
-                                param.setResult(rects);
+                                param.setResult(fourPanes());
                             } catch (Throwable ignored) {
                             }
                         }
@@ -824,12 +1311,15 @@ final class CanvasLayout {
     private static void hookRectOrientation(ClassLoader loader) {
         try {
             Class<?> activity = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.ContainerActivity", loader);
-            XposedBridge.hookAllMethods(activity, "x1", new XC_MethodHook() {
+                    CanvasApi.ACTIVITY, loader);
+            XposedBridge.hookAllMethods(activity, RECT_CHANGED.value(), new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        Object view = XposedHelpers.callMethod(param.thisObject, "x0");
-                        Object adapter = view == null ? null : fieldOfType(view, "u1.c");
+                        if (CanvasApi.isColorOs17() && (param.args.length != 2
+                                || !(param.args[0] instanceof android.app.ActivityManager.RunningTaskInfo)
+                                || !(param.args[1] instanceof Rect))) return;
+                        Object view = XposedHelpers.callMethod(param.thisObject, ACTIVITY_VIEW.value());
+                        Object adapter = view == null ? null : CanvasApi.adapter(view);
                         if (adapter != null && count(adapter) >= 4) {
                             param.setResult(null);
                         }
@@ -837,6 +1327,32 @@ final class CanvasLayout {
                     }
                 }
             });
+            if (CanvasApi.isColorOs17()) {
+                Class<?> decor = XposedHelpers.findClass(
+                        CanvasApi.PACKAGE + "view.EmbeddedViewDecor", loader);
+                XposedHelpers.findAndHookMethod(decor, "E", Rect.class, boolean.class,
+                        new XC_MethodHook() {
+                            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                                View pane = (View) param.thisObject;
+                                if (!(pane.getParent() instanceof View canvas)) return;
+                                Object adapter = CanvasApi.adapter(canvas);
+                                if (adapter == null || count(adapter) != 3) return;
+                                Rect requested = (Rect) param.args[0];
+                                Rect launch = (Rect) XposedHelpers.callMethod(pane, "getLaunchRect");
+                                if (requested == null || requested.isEmpty() || launch == null
+                                        || launch.isEmpty()
+                                        || (!isLandscape(canvas) && (requested.width() > requested.height())
+                                                != (launch.width() > launch.height()))
+                                        || (requested.width() == launch.width()
+                                                && requested.height() == launch.height())) return;
+                                // 页面切换请求沿用了系统分屏尺寸，固定窗格继续使用当前的启动尺寸。
+                                param.setResult(null);
+                                log("kept pane size on page change " + launch.width() + "x"
+                                        + launch.height() + " (requested " + requested.width()
+                                        + "x" + requested.height() + ")");
+                            }
+                        });
+            }
             log("rect orientation guarded");
         } catch (Throwable error) {
             log("rect orientation hook failed: " + error);
@@ -852,13 +1368,18 @@ final class CanvasLayout {
      */
     private static void hookNativeFour(ClassLoader loader) {
         try {
-            Class<?> view = XposedHelpers.findClass(CONTAINER_VIEW, loader);
-            XposedHelpers.findAndHookMethod(view, "w1", new XC_MethodHook() {
+            Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+            XposedHelpers.findAndHookMethod(view, LAYOUT_CHILDREN.value(), new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        Object adapter = fieldOfType(param.thisObject, "u1.c");
+                        Object adapter = CanvasApi.adapter(param.thisObject);
                         if (adapter == null || count(adapter) != 4) return;
-                        XposedHelpers.callMethod(param.thisObject, "N2");
+                        if (CanvasApi.isColorOs17()) {
+                            Object rects = XposedHelpers.callMethod(param.thisObject, "getRectList");
+                            if (rects instanceof java.util.List
+                                    && ((java.util.List<?>) rects).size() == 4) return;
+                        }
+                        XposedHelpers.callMethod(param.thisObject, LAYOUT.value());
                     } catch (Throwable error) {
                         log("native four layout failed: " + error);
                     }
@@ -872,15 +1393,17 @@ final class CanvasLayout {
         // N2() 会往 getRectList() 里 addAll，但只有 w1() 会先清。resume、
         // 直接调 N2 的路径没清，矩形会累加到 6、9 个，交换和调节条全错位。
         try {
-            Class<?> view = XposedHelpers.findClass(CONTAINER_VIEW, loader);
-            XposedHelpers.findAndHookMethod(view, "N2", new XC_MethodHook() {
+            Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+            XposedHelpers.findAndHookMethod(view, LAYOUT.value(), new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        Object rects = XposedHelpers.getObjectField(param.thisObject, "l");
+                        Object rects = XposedHelpers.callMethod(param.thisObject, "getRectList");
                         if (rects instanceof java.util.List) {
                             ((java.util.List<?>) rects).clear();
                         }
-                        Object union = XposedHelpers.getObjectField(param.thisObject, "m");
+                        Object union = CanvasApi.isColorOs17()
+                                ? XposedHelpers.callMethod(param.thisObject, "getRectListUnion")
+                                : XposedHelpers.getObjectField(param.thisObject, "m");
                         if (union instanceof Rect) {
                             ((Rect) union).setEmpty();
                         }
@@ -894,68 +1417,69 @@ final class CanvasLayout {
         }
 
         try {
-            Class<?> util = XposedHelpers.findClass("B1.l", loader);
-            XposedBridge.hookAllMethods(util, "M1", new XC_MethodHook() {
+            Class<?> util = XposedHelpers.findClass(UTIL.value(), loader);
+            XposedHelpers.findAndHookMethod(util, THREE_LAYOUT.value(),
+                    java.util.List.class, int.class, float.class, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     try {
                         Object input = param.args[0];
                         if (!(input instanceof java.util.List)) return;
-                        if (((java.util.List<?>) input).size() != 4) return;
+                        int count = ((java.util.List<?>) input).size();
+                        if (CanvasApi.isColorOs17() && (count == 3 || count == 4)) {
+                            int mode = (Integer) param.args[1];
+                            Float share = layoutColumnShare.get();
+                            CanvasDisplay display = layoutDisplay.get();
+                            if (display == null) display = fallbackCanvasDisplay();
+                            java.util.List<Rect> panes = proportionalPanes(count, mode,
+                                    share != null ? share : display.landscape() ? CanvasGeometry.LANDSCAPE_LEFT_SHARE
+                                            : CanvasGeometry.defaultLeftShare(count, mode), display);
+                            if (panes.size() != count) return;
+                            int[] order = layoutPaneOrder.get();
+                            param.setResult(inTaskOrder(panes, order));
+                            return;
+                        }
+                        if (count != 4) return;
                         Object result = param.getResult();
                         if (result instanceof java.util.List
                                 && !((java.util.List<?>) result).isEmpty()) return;
-                        Rect cell = phoneSize();
-                        int gap = Math.round(10f * android.content.res.Resources
-                                .getSystem().getDisplayMetrics().density);
-                        int w = cell.width();
-                        int h = cell.height();
-                        java.util.ArrayList<Rect> rects = new java.util.ArrayList<>();
-                        for (int i = 0; i < 4; i++) {
-                            int left = (i % 2) * (w + gap);
-                            int top = (i / 2) * (h + gap);
-                            rects.add(new Rect(left, top, left + w, top + h));
-                        }
-                        param.setResult(rects);
+                        param.setResult(fourPanes());
                     } catch (Throwable ignored) {
                     }
                 }
             });
-            log("four rect layout hooked");
+            log("multi-window rect layout hooked");
         } catch (Throwable error) {
             log("four rect layout hook failed: " + error);
         }
 
         try {
-            Class<?> view = XposedHelpers.findClass(CONTAINER_VIEW, loader);
-            Class<?> taskData = XposedHelpers.findClass("u1.d", loader);
-            XposedHelpers.findAndHookMethod(view, "S1", new XC_MethodHook() {
+            Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+            Class<?> taskData = XposedHelpers.findClass(TASK.value(), loader);
+            XposedHelpers.findAndHookMethod(view, CLOSE_TASK.value(), taskData, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        Object adapter = fieldOfType(param.thisObject, "u1.c");
-                        Object focus = adapter == null ? "?" : XposedHelpers.callMethod(adapter, "h");
-                        log("S1 focus=" + focus + " count="
-                                + (adapter == null ? -1 : count(adapter)));
-                    } catch (Throwable ignored) {
-                    }
-                }
-            });
-            XposedHelpers.findAndHookMethod(view, "T1", taskData, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object adapter = fieldOfType(param.thisObject, "u1.c");
+                        Object adapter = CanvasApi.adapter(param.thisObject);
                         int total = adapter == null ? -1 : count(adapter);
                         // u1() 会被 ART 内联进 T1，hook 不到，直接在这里补四窗的关闭
                         if (adapter == null || total != 4) return;
-                        XposedHelpers.callMethod(param.thisObject, "X1", param.args[0]);
+                        XposedHelpers.callMethod(param.thisObject, REMOVE_TASK.value(), param.args[0]);
+                        if (CanvasApi.isColorOs17() && count(adapter) == 3) {
+                            Object context = XposedHelpers.callMethod(param.thisObject, "getContext");
+                            Object activity = XposedHelpers.callStaticMethod(
+                                    XposedHelpers.findClass(UTIL.value(), loader),
+                                    ACTIVITY_FROM_CONTEXT.value(), context);
+                            Object manager = XposedHelpers.callStaticMethod(XposedHelpers.findClass(
+                                    "com.oplus.flexiblewindow.FlexibleWindowManager", loader),
+                                    "getInstance");
+                            XposedHelpers.callMethod(manager, "removeEmbeddedContainerTask",
+                                    XposedHelpers.callMethod(param.args[0], "t"),
+                                    XposedHelpers.callMethod(activity, "E0"));
+                            param.setResult(null);
+                        }
                         log("close window four");
                     } catch (Throwable error) {
                         log("close four failed: " + error);
                     }
-                }
-            });
-            XposedHelpers.findAndHookMethod(view, "u1", taskData, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    log("u1 reached");
                 }
             });
             log("four close hooked");
@@ -967,7 +1491,7 @@ final class CanvasLayout {
     /** o2() 往 A1.b.l() 的 Rect[] 里按下标写，数组按三窗分配，四窗会越界。 */
     private static void hookFlexibleUiArray(ClassLoader loader) {
         try {
-            Class<?> ui = XposedHelpers.findClass("A1.b", loader);
+            Class<?> ui = XposedHelpers.findClass(UI_MANAGER.value(), loader);
             XposedBridge.hookAllMethods(ui, "l", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     Object result = param.getResult();
@@ -976,6 +1500,9 @@ final class CanvasLayout {
                     if (rects.length >= 4) return;
                     Rect[] bigger = new Rect[4];
                     System.arraycopy(rects, 0, bigger, 0, rects.length);
+                    if (CanvasApi.isColorOs17()) {
+                        XposedHelpers.setObjectField(param.thisObject, "r", bigger);
+                    }
                     param.setResult(bigger);
                 }
             });
@@ -991,8 +1518,8 @@ final class CanvasLayout {
     private static void hookAddLimit(ClassLoader loader) {
         try {
             Class<?> controller = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.s0", loader);
-            Class<?> taskData = XposedHelpers.findClass("u1.d", loader);
+                    CONTROLLER.value(), loader);
+            Class<?> taskData = XposedHelpers.findClass(TASK.value(), loader);
             XposedHelpers.findAndHookMethod(controller, "d", taskData, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     addingTask.set(Boolean.TRUE);
@@ -1002,13 +1529,13 @@ final class CanvasLayout {
                     addingTask.remove();
                 }
             });
-            Class<?> adapter = XposedHelpers.findClass("u1.c", loader);
+            Class<?> adapter = XposedHelpers.findClass(ADAPTER.value(), loader);
             XposedHelpers.findAndHookMethod(adapter, "getCount", new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
                     if (addingTask.get() == null) return;
                     // 只放行上限判断这一次，后面的 getCount 保持真实值
                     addingTask.remove();
-                    param.setResult(2);
+                    if (Integer.valueOf(3).equals(param.getResult())) param.setResult(2);
                 }
             });
             log("add limit lifted");
@@ -1020,8 +1547,8 @@ final class CanvasLayout {
     /** 三分屏布局方向可控：N2 会拿自己的字段覆盖方向，这里直接改传给 M1 的参数。 */
     private static void hookOrientation(ClassLoader loader) {
         try {
-            Class<?> util = XposedHelpers.findClass("B1.l", loader);
-            XposedHelpers.findAndHookMethod(util, "M1",
+            Class<?> util = XposedHelpers.findClass(UTIL.value(), loader);
+            XposedHelpers.findAndHookMethod(util, THREE_LAYOUT.value(),
                     java.util.List.class, int.class, float.class, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
                             int forced = forcedOrientation;
@@ -1046,7 +1573,7 @@ final class CanvasLayout {
         for (Object container : containers.keySet()) {
             try {
                 layoutKeys.remove(container);
-                XposedHelpers.callMethod(container, "N2");
+                XposedHelpers.callMethod(container, LAYOUT.value());
             } catch (Throwable error) {
                 log("apply orientation failed: " + error);
             }
@@ -1060,10 +1587,12 @@ final class CanvasLayout {
      * 排布规则和原版平板完全一致。
      */
     private static void relayoutDirected(Object container, ClassLoader loader) {
+        // W2 已直接使用 V1 的结果，额外摆一次会与系统布局状态脱节。
+        if (CanvasApi.isColorOs17()) return;
         int orientation = forcedOrientation;
         if (orientation == 0) return;
         try {
-            Object adapter = fieldOfType(container, "u1.c");
+            Object adapter = CanvasApi.adapter(container);
             if (adapter == null) return;
             int total = count(adapter);
             if (total < 3) return;
@@ -1080,7 +1609,7 @@ final class CanvasLayout {
             float density = android.content.res.Resources.getSystem()
                     .getDisplayMetrics().density;
             Object rects = XposedHelpers.callStaticMethod(
-                    XposedHelpers.findClass("B1.l", loader), "M1", tasks, orientation, density);
+                    XposedHelpers.findClass(UTIL.value(), loader), THREE_LAYOUT.value(), tasks, orientation, density);
             if (!(rects instanceof java.util.List)) return;
             java.util.List<?> list = (java.util.List<?>) rects;
             if (list.size() != 3) {
@@ -1089,7 +1618,7 @@ final class CanvasLayout {
             }
             Object scale = XposedHelpers.getFloatField(container, "t");
             for (int i = 0; i < 3; i++) {
-                Object decor = XposedHelpers.callMethod(container, "q0", i);
+                Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), i);
                 if (!(decor instanceof android.view.View)) continue;
                 Object rect = list.get(i);
                 if (!(rect instanceof Rect)) continue;
@@ -1109,40 +1638,43 @@ final class CanvasLayout {
     }
 
     /**
-     * 三窗/四窗的调节条只允许点击，不允许拖动改比例。
-     *
-     * 点击走 E.p0()（弹菜单），拖动走 E.r0()（滚动回调里调），这里只掐 r0。
+     * 总览中沿用系统分隔条的手势，拖动时预览分隔线，松手时提交窗格尺寸。
      */
     private static void hookDragLock(ClassLoader loader) {
         try {
             Class<?> bar = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.E", loader);
+                    SPLIT_BAR.value(), loader);
             Class<?> item = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.E$c", loader);
-            XposedHelpers.findAndHookMethod(bar, "r0", item,
+                    SPLIT_BAR_ITEM.value(), loader);
+            XposedHelpers.findAndHookMethod(bar, BAR_DRAG.value(), item,
                     android.view.MotionEvent.class, android.view.MotionEvent.class,
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
                             try {
                                 Object container = XposedHelpers.getObjectField(
                                         param.thisObject, "h");
-                                Object adapter = fieldOfType(container, "u1.c");
+                                Object adapter = CanvasApi.adapter(container);
                                 if (adapter != null && count(adapter) >= 3) {
                                     param.setResult(null);
+                                    if (CanvasApi.isColorOs17()) {
+                                        previewColumnDrag(param.thisObject, (View) container, adapter,
+                                                param.args[0], (MotionEvent) param.args[1],
+                                                (MotionEvent) param.args[2]);
+                                    }
                                 }
                             } catch (Throwable ignored) {
                             }
                         }
                     });
             // r0/s0 最后都落到 q0 去算新位置，这里再兜一层
-            XposedHelpers.findAndHookMethod(bar, "q0", item,
+            XposedHelpers.findAndHookMethod(bar, BAR_SCROLL.value(), item,
                     float.class, float.class, float.class, float.class, boolean.class,
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
                             try {
                                 Object container = XposedHelpers.getObjectField(
                                         param.thisObject, "h");
-                                Object adapter = fieldOfType(container, "u1.c");
+                                Object adapter = CanvasApi.adapter(container);
                                 if (adapter != null && count(adapter) >= 3) {
                                     param.setResult(null);
                                 }
@@ -1150,10 +1682,156 @@ final class CanvasLayout {
                             }
                         }
                     });
+            if (CanvasApi.isColorOs17()) {
+                hookColumnDragEnd(loader, bar);
+                hookColumnHandles(bar);
+                hookWindowHeaderDrag(loader);
+            }
             log("drag lock hooked");
         } catch (Throwable error) {
             log("drag lock hook failed: " + error);
         }
+    }
+
+    private static void hookColumnHandles(Class<?> bar) {
+        XposedHelpers.findAndHookMethod(bar, "w", Rect.class, Rect.class, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
+                Object adapter = CanvasApi.adapter(canvas);
+                if (adapter == null || count(adapter) < 3) return;
+                Rect first = (Rect) param.args[0];
+                Rect second = (Rect) param.args[1];
+                if (isLandscape((View) canvas)) {
+                    int main = mainPane(canvas, adapter);
+                    List<?> panes = (List<?>) XposedHelpers.callMethod(canvas, "getRectList");
+                    if (main < 0 || panes.size() <= main
+                            || Math.max(first.left, second.left) != ((Rect) panes.get(main)).left) {
+                        param.setResult(null);
+                    }
+                    return;
+                }
+                if (!CanvasGeometry.hasPhoneRatioColumns(
+                        count(adapter), layoutMode(adapter))) return;
+                if (first.right >= second.left && second.right >= first.left) return;
+                int top = Math.max(first.top, second.top);
+                int bottom = Math.min(first.bottom, second.bottom);
+                if (bottom <= top) {
+                    param.setResult(null);
+                    return;
+                }
+                // 系统按相同上下边缘定位竖分隔条，等比窗格以实际重叠区为准。
+                param.args[0] = new Rect(first.left, top, first.right, bottom);
+                param.args[1] = new Rect(second.left, top, second.right, bottom);
+            }
+        });
+    }
+
+    private static void hookWindowHeaderDrag(ClassLoader loader) {
+        Class<?> header = XposedHelpers.findClass(CanvasApi.PACKAGE + "v", loader);
+        XposedHelpers.findAndHookMethod(header, "L0", View.class, MotionEvent.class,
+                new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        Object canvas = XposedHelpers.getObjectField(param.thisObject, "n");
+                        Object adapter = CanvasApi.adapter(canvas);
+                        if (adapter != null && count(adapter) >= 3) {
+                            // 多窗通过分隔条调节，标题按钮继续走原生点击菜单。
+                            param.setResult(Boolean.FALSE);
+                        }
+                    }
+                });
+    }
+
+    private static final java.util.WeakHashMap<Object, ColumnDrag> columnDrags =
+            new java.util.WeakHashMap<>();
+
+    private record ColumnDrag(View canvas, View handle, long downTime, int panes, int mode,
+                              boolean landscape, float initialShare, float screenWidth) {
+        float shareAt(MotionEvent event, float startX) {
+            return CanvasGeometry.clampLeftShare(initialShare
+                    + (event.getRawX() - startX) / screenWidth);
+        }
+
+        void clearPreview() {
+            handle.setTranslationX(0f);
+        }
+    }
+
+    private static void previewColumnDrag(Object bar, View canvas, Object adapter, Object item,
+                                          MotionEvent start, MotionEvent current) {
+        int total = count(adapter);
+        int mode = layoutMode(adapter);
+        boolean landscape = isLandscape(canvas);
+        if (isFourZoomed(canvas) || current.getPointerCount() != 1
+                || (landscape ? total != 3 : !CanvasGeometry.hasPhoneRatioColumns(total, mode))
+                || !Boolean.TRUE.equals(XposedHelpers.callMethod(item, "k"))) return;
+
+        ColumnDrag drag = columnDrags.get(bar);
+        if (drag == null || drag.downTime() != start.getDownTime()) {
+            if (drag != null) drag.clearPreview();
+            Rect bounds = contentRect(canvas);
+            if (bounds == null) return;
+            float scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
+            int width = bounds.width() - columnGap() * (landscape ? 2 : 1);
+            if (width <= 0 || scale <= 0f) return;
+            View handle = (View) XposedHelpers.callMethod(item, "g");
+            drag = new ColumnDrag(canvas, handle, start.getDownTime(), total, mode,
+                    landscape, columnShare(canvas, total, mode), width * scale);
+            columnDrags.put(bar, drag);
+        }
+        float scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
+        if (scale > 0f) {
+            float shift = (drag.shareAt(current, start.getRawX()) - drag.initialShare())
+                    * drag.screenWidth() / scale;
+            drag.handle().setTranslationX(shift);
+        }
+    }
+
+    private static void hookColumnDragEnd(ClassLoader loader, Class<?> bar) {
+        XposedHelpers.findAndHookMethod(bar, "u0", MotionEvent.class, int.class, int.class,
+                new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
+                            Object adapter = CanvasApi.adapter(canvas);
+                            if (adapter == null || count(adapter) < 3) return;
+                            param.setResult(null);
+                            ColumnDrag drag = columnDrags.remove(param.thisObject);
+                            if (drag == null) return;
+                            drag.clearPreview();
+                            MotionEvent end = (MotionEvent) param.args[0];
+                            if (end.getActionMasked() != MotionEvent.ACTION_UP
+                                    || end.getDownTime() != drag.downTime()
+                                    || count(adapter) != drag.panes() || isFourZoomed(canvas)
+                                    || isLandscape(drag.canvas()) != drag.landscape()
+                                    || layoutMode(adapter) != drag.mode()) return;
+                            float share = drag.shareAt(end, (Integer) param.args[1]);
+                            if (Math.abs(share - drag.initialShare()) < 0.002f) return;
+                            columnShares(drag.canvas(), drag.panes()).put(canvas, share);
+                            layoutKeys.remove(canvas);
+                            XposedHelpers.callMethod(canvas, "setNeedUpdateFlexibleTaskViewFrameFlag", true);
+                            drag.canvas().requestLayout();
+                            log("column resize " + drag.panes() + " windows left=" + share);
+                        } catch (Throwable error) {
+                            log("column resize failed: " + error);
+                        }
+                    }
+                });
+        Class<?> gestures = XposedHelpers.findClass(CanvasApi.PACKAGE + "A", loader);
+        XposedHelpers.findAndHookMethod(gestures, "T", MotionEvent.class, new XC_MethodHook() {
+            @Override protected void afterHookedMethod(MethodHookParam param) {
+                MotionEvent event = (MotionEvent) param.args[0];
+                if (event.getActionMasked() != MotionEvent.ACTION_CANCEL
+                        && event.getActionMasked() != MotionEvent.ACTION_UP
+                        && event.getActionMasked() != MotionEvent.ACTION_POINTER_DOWN) return;
+                for (java.util.Iterator<ColumnDrag> iterator = columnDrags.values().iterator();
+                        iterator.hasNext(); ) {
+                    ColumnDrag drag = iterator.next();
+                    if (drag.downTime() != event.getDownTime()) continue;
+                    drag.clearPreview();
+                    iterator.remove();
+                }
+            }
+        });
     }
 
 
@@ -1165,9 +1843,15 @@ final class CanvasLayout {
      */
     private static void hookTaskDataBounds(ClassLoader loader) {
         try {
-            Class<?> taskData = XposedHelpers.findClass("u1.d", loader);
+            Class<?> taskData = XposedHelpers.findClass(TASK.value(), loader);
             XposedHelpers.findAndHookMethod(taskData, "o", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
+                    if (CanvasApi.isColorOs17()) {
+                        Object bounds = XposedHelpers.getAdditionalInstanceField(
+                                param.thisObject, PROPORTIONAL_BOUNDS);
+                        if (bounds instanceof Rect) param.setResult(new Rect((Rect) bounds));
+                        return;
+                    }
                     if (!multiWindowMode) return;
                     param.setResult(currentTarget());
                 }
@@ -1182,26 +1866,63 @@ final class CanvasLayout {
 
     private static void hookFullscreen(ClassLoader loader) {
         try {
-            Class<?> view = XposedHelpers.findClass(CONTAINER_VIEW, loader);
-            XposedHelpers.findAndHookMethod(view, "N2", new XC_MethodHook() {
+            Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+            XposedHelpers.findAndHookMethod(view, LAYOUT.value(), new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     syncTaskData(param.thisObject);
+                    if (CanvasApi.isColorOs17()) {
+                        Object adapter = CanvasApi.adapter(param.thisObject);
+                        param.setObjectExtra("canvasplus.columnShare", layoutColumnShare.get());
+                        param.setObjectExtra("canvasplus.paneOrder", layoutPaneOrder.get());
+                        param.setObjectExtra("canvasplus.display", layoutDisplay.get());
+                        if (adapter != null) {
+                            int panes = count(adapter);
+                            int mode = layoutMode(adapter);
+                            layoutColumnShare.set(columnShare(param.thisObject, panes, mode));
+                            layoutPaneOrder.set(CanvasGeometry.mainPane(panes,
+                                    mainPaneMode((View) param.thisObject, adapter)) >= 0
+                                    ? panePositions(param.thisObject, adapter) : null);
+                            CanvasDisplay display = canvasDisplay((View) param.thisObject);
+                            layoutDisplay.set(display);
+                            if (panes >= 3 && (display.landscape()
+                                    || CanvasGeometry.hasPhoneRatioColumns(panes, mode))) {
+                                // 先更新已有任务的比例，再把它们摆进新窗格。
+                                forcePhoneSize(param.thisObject, true);
+                            }
+                        }
+                    }
                     oLock = multiWindowMode;
                 }
 
                 @Override protected void afterHookedMethod(MethodHookParam param) {
+                    if (CanvasApi.isColorOs17()) {
+                        Float previous = (Float) param.getObjectExtra("canvasplus.columnShare");
+                        if (previous == null) layoutColumnShare.remove();
+                        else layoutColumnShare.set(previous);
+                        int[] previousOrder = (int[]) param.getObjectExtra("canvasplus.paneOrder");
+                        if (previousOrder == null) layoutPaneOrder.remove();
+                        else layoutPaneOrder.set(previousOrder);
+                        CanvasDisplay previousDisplay = (CanvasDisplay) param.getObjectExtra("canvasplus.display");
+                        if (previousDisplay == null) layoutDisplay.remove();
+                        else layoutDisplay.set(previousDisplay);
+                    }
                     forcePhoneSize(param.thisObject);
                     oLock = false;
                     if (forcedOrientation != 0) {
                         relayoutDirected(param.thisObject,
                                 param.thisObject.getClass().getClassLoader());
                     }
-                    if (multiWindowMode) dumpLayout(param.thisObject);
                     try {
-                        Object adapter = fieldOfType(param.thisObject, "u1.c");
+                        Object adapter = CanvasApi.adapter(param.thisObject);
                         if (adapter == null) return;
                         int panes = count(adapter);
+                        if (panes >= 3) dumpLayout(param.thisObject);
                         if (panes < 3 || isFourZoomed(param.thisObject)) return;
+                        if (CanvasApi.isColorOs17()) {
+                            View canvas = (View) param.thisObject;
+                            if (!isZoomAnimating(canvas)) applyOverview(canvas, panes);
+                            return;
+                        }
                         // 布局完成时画布可能还停在 1.0（尤其是从二窗加进第三个应用），
                         // 补一次总览缩放，别等用户碰一下才恢复
                         final Object canvas = param.thisObject;
@@ -1239,7 +1960,7 @@ final class CanvasLayout {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     if (forcedOrientation == 0) return;
                     try {
-                        Object adapter = fieldOfType(param.thisObject, "u1.c");
+                        Object adapter = CanvasApi.adapter(param.thisObject);
                         if (adapter == null) return;
                         if (count(adapter) == 4) return; // 四窗由 w1() 里的 N2() 处理
                         relayoutDirected(param.thisObject,
@@ -1316,7 +2037,7 @@ final class CanvasLayout {
     private static int currentCanvasCount() {
         for (Object container : containers.keySet()) {
             try {
-                Object adapter = fieldOfType(container, "u1.c");
+                Object adapter = CanvasApi.adapter(container);
                 if (adapter != null) return count(adapter);
             } catch (Throwable ignored) {
             }
@@ -1324,23 +2045,59 @@ final class CanvasLayout {
         return -1;
     }
 
-    /** 画布固定竖屏。pscanvas 自己会按窗口方向调 setRequestedOrientation，这里全拦下来。 */
-    private static void lockPortrait(ClassLoader loader) {
+    private static int canvasScreenOrientation(Activity activity) {
+        if (!CanvasApi.isColorOs17()) return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+        Object adapter = CanvasApi.adapter(XposedHelpers.callMethod(activity, ACTIVITY_VIEW.value()));
+        int panes = adapter == null ? 0 : count(adapter);
+        return panes == 2 ? ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                : ActivityInfo.SCREEN_ORIENTATION_USER;
+    }
+
+    private static void updateCanvasScreenOrientation(Activity activity) {
+        int wanted = canvasScreenOrientation(activity);
+        if (!activity.isFinishing() && activity.getRequestedOrientation() != wanted) {
+            activity.setRequestedOrientation(wanted);
+        }
+    }
+
+    private static void hookScreenOrientation(ClassLoader loader) {
         try {
             XposedHelpers.findAndHookMethod("android.app.Activity", loader,
                     "setRequestedOrientation", int.class, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!CONTAINER_ACTIVITY.equals(
+                            if (!CanvasApi.ACTIVITY.equals(
                                     param.thisObject.getClass().getName())) {
                                 return;
                             }
-                            param.args[0] = android.content.pm.ActivityInfo
-                                    .SCREEN_ORIENTATION_PORTRAIT;
+                            param.args[0] = canvasScreenOrientation((Activity) param.thisObject);
                         }
                     });
-            log("portrait locked");
+            if (CanvasApi.isColorOs17()) {
+                XposedHelpers.findAndHookMethod(CanvasApi.ACTIVITY, loader, "onConfigurationChanged",
+                        Configuration.class, new XC_MethodHook() {
+                            @Override protected void afterHookedMethod(MethodHookParam param) {
+                                View canvas = (View) XposedHelpers.callMethod(param.thisObject, ACTIVITY_VIEW.value());
+                                Object adapter = CanvasApi.adapter(canvas);
+                                if (adapter == null || count(adapter) < 3) return;
+                                layoutKeys.remove(canvas);
+                                View root = canvas.getRootView();
+                                boolean wasLandscape = root.getWidth() > root.getHeight();
+                                boolean landscape = ((Configuration) param.args[0]).orientation
+                                        == Configuration.ORIENTATION_LANDSCAPE;
+                                if (wasLandscape != landscape) {
+                                    fourZoomed.remove(canvas);
+                                    enlargedPanes.remove(canvas);
+                                    pendingMainSwaps.remove(canvas);
+                                    cancelZoom(canvas);
+                                    markEnlarged(adapter, count(adapter), -1);
+                                }
+                                canvas.requestLayout();
+                            }
+                        });
+            }
+            log("canvas screen orientation hooked");
         } catch (Throwable error) {
-            log("portrait lock failed: " + error);
+            log("canvas screen orientation hook failed: " + error);
         }
     }
 
@@ -1348,18 +2105,15 @@ final class CanvasLayout {
     private static void hookResume(ClassLoader loader) {
         try {
             Class<?> activity = XposedHelpers.findClass(
-                    "com.oplus.pscanvas.canvasmode.canvas.ContainerActivity", loader);
+                    CanvasApi.ACTIVITY, loader);
             XposedHelpers.findAndHookMethod(activity, "onResume", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        // 触发一次方向设置，具体值由 lockPortrait 统一改成竖屏
-                        XposedHelpers.callMethod(param.thisObject,
-                                "setRequestedOrientation",
-                                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+                        updateCanvasScreenOrientation((Activity) param.thisObject);
                     } catch (Throwable ignored) {
                     }
                     try {
-                        Object view = XposedHelpers.callMethod(param.thisObject, "x0");
+                        Object view = XposedHelpers.callMethod(param.thisObject, ACTIVITY_VIEW.value());
                         if (view == null) return;
                         new android.os.Handler(android.os.Looper.getMainLooper())
                                 .postDelayed(() -> {
@@ -1367,10 +2121,13 @@ final class CanvasLayout {
                                         attempts = 0;
                                         syncTaskData(view);
                                         // 二窗是系统原生分屏，重排和看门狗都留给系统
-                                        Object adapter = fieldOfType(view, "u1.c");
+                                        Object adapter = CanvasApi.adapter(view);
                                         if (adapter == null || count(adapter) < 3) return;
                                         forcePhoneSize(view);
-                                        XposedHelpers.callMethod(view, "N2");
+                                        if (!CanvasApi.isColorOs17()
+                                                || contentRect(view) == null) {
+                                            XposedHelpers.callMethod(view, LAYOUT.value());
+                                        }
                                         startWatchdog(view);
                                     } catch (Throwable error) {
                                         log("resume reapply failed: " + error);
@@ -1380,11 +2137,14 @@ final class CanvasLayout {
                     }
                 }
             });
-            XposedBridge.hookAllMethods(activity, "o1", new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    shiftForIme(param);
-                }
-            });
+            if (!CanvasApi.isColorOs17()) {
+                XposedHelpers.findAndHookMethod(activity, IME_HEIGHT.value(), int.class,
+                        new XC_MethodHook() {
+                            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                                shiftForIme(param);
+                            }
+                        });
+            }
             log("resume hooked");
         } catch (Throwable error) {
             log("resume hook failed: " + error);
@@ -1394,37 +2154,41 @@ final class CanvasLayout {
     /** 点击窗口前刷新一次布局，保证 T() 拿到的矩形是最新的。 */
     private static void hookClick(ClassLoader loader) {
         try {
-            Class<?> view = XposedHelpers.findClass(CONTAINER_VIEW, loader);
-            XposedBridge.hookAllMethods(view, "A2", new XC_MethodHook() {
+            Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+            XposedBridge.hookAllMethods(view, ANIMATE_SCALE.value(), new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     log("A2 tx=" + param.args[0] + " ty=" + param.args[1]
                             + " scale=" + param.args[2] + " mode=" + param.args[4]);
                     try {
-                        // mode 3 是输入法上移，官方已经算好 ty，别重算
                         int mode = (Integer) param.args[4];
-                        if (mode == 3) return;
-                        Object adapter = fieldOfType(param.thisObject, "u1.c");
+                        Object adapter = CanvasApi.adapter(param.thisObject);
                         if (adapter == null) return;
                         int total = count(adapter);
                         if (total < 3) return;
-                        float scale = (Float) param.args[2];
-                        if (scale <= 0f) return;
+                        if (CanvasApi.isColorOs17()) {
+                            if ((mode == 0 || mode == 1) && !focusing.contains(param.thisObject)) {
+                                param.setResult(Boolean.FALSE);
+                            }
+                            return;
+                        }
+                        if (mode == 3) return;
                         android.view.View self = (android.view.View) param.thisObject;
                         android.view.View parent = (android.view.View) self.getParent();
                         Rect union = contentRect(param.thisObject);
-                        if (union == null || parent == null) return;
+                        if (union == null || union.isEmpty() || parent == null) return;
 
                         int margin = marginPx();
                         float topInset = statusBarHeight() + margin;
                         float bottomInset = margin;
-                        // pivot 是 (0,0)，view 自己的 top 会被缩放吃掉，先补回来
-                        float base = topInset - self.getTop() * scale;
                         float avail = parent.getHeight() - topInset - bottomInset;
+                        float scale = (Float) param.args[2];
+                        if (scale <= 0f) return;
+                        float base = topInset - self.getTop() * scale;
                         float drawn = union.height() * scale;
                         float ty;
                         if (drawn <= avail + 1f) {
                             // 整体放得下：上下左右都居中
-                            ty = base + (avail - drawn) / 2f;
+                            ty = base + (avail - drawn) / 2f - union.top * scale;
                             float width = union.width() * scale;
                             if (width < parent.getWidth()) {
                                 param.args[0] = (parent.getWidth() - width) / 2f;
@@ -1447,68 +2211,54 @@ final class CanvasLayout {
                     }
                 }
             });
-            XposedHelpers.findAndHookMethod(view, "T",
+            XposedHelpers.findAndHookMethod(view, FOCUS_SCALE.value(),
                     int.class, int.class, int.class, boolean.class, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            Object canvas = param.thisObject;
                             int index = (Integer) param.args[0];
                             int duration = (Integer) param.args[1];
                             boolean animate = (Boolean) param.args[3];
                             try {
-                                Object adapter = fieldOfType(param.thisObject, "u1.c");
-                                // onLayout 每次都自动聚焦缩放，缩小态要保持总览
-                                boolean shrunk = !isFourZoomed(param.thisObject);
-                                if (adapter != null && duration == 0 && shrunk
-                                        && (count(adapter) == 4 || count(adapter) == 3)) {
-                                    param.setResult(Boolean.FALSE);
-                                    return;
-                                }
-                            } catch (Throwable ignored) {
-                            }
-                            if (index < 0 || duration != 450 || !animate) return;
-                            try {
-                                Object adapter = fieldOfType(param.thisObject, "u1.c");
+                                Object adapter = CanvasApi.adapter(canvas);
                                 int total = adapter == null ? 0 : count(adapter);
-                                // 二窗是系统原生分屏，点击走原版聚焦
-                                if (total < 3) return;
-                                // 从菜单缩小之后，点击窗口只切焦点，放大走窗口菜单
-                                if (noClickZoom()
-                                        && Boolean.TRUE.equals(
-                                                menuShrunk.get(param.thisObject))) {
+                                if (total < 3 || index < 0 || index >= total) return;
+                                if (CanvasApi.isColorOs17()) {
+                                    param.setResult(Boolean.FALSE);
+                                    if (duration != 450 || !animate || focusing.contains(canvas)) return;
                                     int mode = (Integer) param.args[2];
-                                    boolean focus = (Boolean) param.args[3];
-                                    if (focus && mode != 2) {
+                                    boolean autoSwap = CanvasGeometry.mainPane(total,
+                                            mainPaneMode((View) canvas, adapter)) >= 0
+                                            && autoMainWindow(((View) canvas).getContext());
+                                    if (isFourZoomed(canvas) || (!isLandscape((View) canvas)
+                                            && !autoSwap && !Settings.preventClickZoom())) {
+                                        changeZoom((View) canvas, adapter, index, true);
+                                    } else if (mode != 2) {
                                         XposedHelpers.callMethod(adapter, "I", index);
                                     }
-                                    param.setObjectExtra("canvasplus.skipped", Boolean.TRUE);
+                                    return;
+                                }
+                                if (duration == 0 && !isFourZoomed(canvas)) {
                                     param.setResult(Boolean.FALSE);
-                                    log("click zoom skipped");
                                     return;
                                 }
-                                if (total == 3) {
-                                    // 三窗点窗口就是放大：和四窗一样把状态同步好
-                                    fourZoomed.put(param.thisObject, Boolean.TRUE);
-                                    for (int i = 0; i < total; i++) {
-                                        Object task = XposedHelpers.callMethod(
-                                                adapter, "getItem", i);
-                                        if (task != null) {
-                                            XposedHelpers.callMethod(task, "p0", i == index);
-                                        }
+                                if (duration != 450 || !animate) return;
+                                // 从菜单缩小之后，点击窗口只切焦点，放大走窗口菜单
+                                if (Boolean.TRUE.equals(menuShrunk.get(canvas))
+                                        && Settings.preventClickZoom()) {
+                                    int mode = (Integer) param.args[2];
+                                    if (mode != 2) {
+                                        XposedHelpers.callMethod(adapter, "I", index);
                                     }
-                                }
-                                if (total == 4) {
-                                    // 四窗点窗口就是放大：同步状态，菜单才会变成"缩小窗口"
-                                    fourZoomed.put(param.thisObject, Boolean.TRUE);
-                                    for (int i = 0; i < total; i++) {
-                                        Object task = XposedHelpers.callMethod(
-                                                adapter, "getItem", i);
-                                        if (task != null) {
-                                            XposedHelpers.callMethod(task, "p0", i == index);
-                                        }
-                                    }
+                                    param.setResult(Boolean.FALSE);
+                                    log("click zoom skipped after shrink, focus=" + index);
                                     return;
                                 }
-                                layoutKeys.remove(param.thisObject);
-                                XposedHelpers.callMethod(param.thisObject, "N2");
+                                menuShrunk.remove(canvas);
+                                fourZoomed.put(canvas, Boolean.TRUE);
+                                markEnlarged(adapter, total, index);
+                                if (total == 4) return;
+                                layoutKeys.remove(canvas);
+                                XposedHelpers.callMethod(canvas, LAYOUT.value());
                             } catch (Throwable error) {
                                 log("click refresh failed: " + error);
                             }
@@ -1527,14 +2277,24 @@ final class CanvasLayout {
     /** 定期检查任务尺寸，画布切回来以后任务可能被系统恢复成全屏。 */
     private static void startWatchdog(Object view) {
         if (watchdogs.containsKey(view)) return;
+        if (!(view instanceof android.view.View)) return;
         watchdogs.put(view, Boolean.TRUE);
+        java.lang.ref.WeakReference<android.view.View> reference =
+                new java.lang.ref.WeakReference<>((android.view.View) view);
         final android.os.Handler handler =
                 new android.os.Handler(android.os.Looper.getMainLooper());
         handler.postDelayed(new Runnable() {
             @Override public void run() {
+                android.view.View canvas = reference.get();
+                if (canvas == null || !canvas.isAttachedToWindow()) {
+                    watchdogs.remove(canvas);
+                    return;
+                }
                 try {
-                    syncTaskData(view);
-                    forcePhoneSize(view);
+                    if (canvas.isShown()) {
+                        syncTaskData(canvas);
+                        forcePhoneSize(canvas);
+                    }
                 } catch (Throwable ignored) {
                 }
                 handler.postDelayed(this, 1000);
@@ -1558,6 +2318,131 @@ final class CanvasLayout {
         return new Rect(0, 0, dm.widthPixels, availH);
     }
 
+    private static int columnGap() {
+        return Math.max(1, Math.round(2f * android.content.res.Resources
+                .getSystem().getDisplayMetrics().density));
+    }
+
+    private static java.util.Map<Object, Float> columnShares(View canvas, int count) {
+        if (isLandscape(canvas)) return landscapeColumnShares;
+        return count == 4 ? fourColumnShares : threeColumnShares;
+    }
+
+    private static float columnShare(Object canvas, int count, int mode) {
+        View view = (View) canvas;
+        float initial = isLandscape(view) ? CanvasGeometry.LANDSCAPE_LEFT_SHARE
+                : CanvasGeometry.defaultLeftShare(count, mode);
+        return columnShares(view, count).getOrDefault(canvas, initial);
+    }
+
+    private static int layoutMode(Object adapter) {
+        return forcedOrientation != 0 ? forcedOrientation : (Integer) XposedHelpers.callMethod(adapter, "n");
+    }
+
+    private record CanvasDisplay(Rect area, Rect portraitTask, boolean landscape) {}
+
+    private static boolean isLandscape(View canvas) {
+        return canvas.getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+    }
+
+    private static Rect canvasArea(View canvas) {
+        return canvasDisplay(canvas).area();
+    }
+
+    private static CanvasDisplay canvasDisplay(View canvas) {
+        WindowManager manager = canvas.getContext().getSystemService(WindowManager.class);
+        android.view.WindowMetrics metrics = manager.getCurrentWindowMetrics();
+        Rect bounds = metrics.getBounds();
+        WindowInsets insets = canvas.getRootWindowInsets();
+        return canvasDisplay(bounds.width(), bounds.height(),
+                insets == null ? metrics.getWindowInsets() : insets);
+    }
+
+    private static CanvasDisplay fallbackCanvasDisplay() {
+        android.util.DisplayMetrics metrics = android.content.res.Resources.getSystem().getDisplayMetrics();
+        return canvasDisplay(metrics.widthPixels, metrics.heightPixels, null);
+    }
+
+    private static CanvasDisplay canvasDisplay(int width, int height, WindowInsets windowInsets) {
+        Rect portraitTask = new Rect(0, 0, Math.min(width, height),
+                Math.max(width, height) - statusBarHeight());
+        if (width <= height) {
+            return new CanvasDisplay(new Rect(0, statusBarHeight(), width, height), portraitTask, false);
+        }
+        // 横屏画布可进入挖孔区域，系统栏仍按实际占用空间计算。
+        Insets insets = windowInsets == null ? Insets.NONE : windowInsets.getInsets(
+                WindowInsets.Type.navigationBars() | WindowInsets.Type.statusBars());
+        Rect area = new Rect(insets.left, insets.top, width - insets.right, height - insets.bottom);
+        return new CanvasDisplay(area, portraitTask, true);
+    }
+
+    private static java.util.List<Rect> proportionalPanes(int count, int mode, float leftShare,
+                                                         CanvasDisplay display) {
+        int outerMargin = display.landscape() ? 0 : 2 * marginPx();
+        int width = display.area().width() - outerMargin;
+        int height = display.area().height() - outerMargin;
+        if (display.landscape()) {
+            return CanvasGeometry.landscapeRow(width, height, columnGap(), count, leftShare);
+        }
+        if (CanvasGeometry.hasPhoneRatioColumns(count, mode)) {
+            return CanvasGeometry.phoneRatioColumns(width, height, columnGap(), count, mode,
+                    leftShare, display.portraitTask());
+        }
+        return CanvasGeometry.panes(width, height, columnGap(), count, mode, leftShare);
+    }
+
+    private static java.util.List<Rect> fourPanes() {
+        if (CanvasApi.isColorOs17()) {
+            CanvasDisplay display = layoutDisplay.get();
+            return proportionalPanes(4, 0, 0.5f, display == null ? fallbackCanvasDisplay() : display);
+        }
+        Rect cell = phoneSize();
+        int gap = Math.round(10f * android.content.res.Resources
+                .getSystem().getDisplayMetrics().density);
+        return CanvasGeometry.panes(2 * cell.width() + gap, 2 * cell.height() + gap, gap, 4, 0);
+    }
+
+    private static java.util.List<Rect> taskTargets(Object canvas, Object adapter, int count) {
+        if (!CanvasApi.isColorOs17()) return java.util.Collections.nCopies(count, phoneSize());
+
+        CanvasDisplay display = canvasDisplay((View) canvas);
+        Rect target = display.portraitTask();
+
+        int mode = layoutMode(adapter);
+        if (!display.landscape() && CanvasGeometry.hasPhoneRatioColumns(count, mode)) {
+            return java.util.Collections.nCopies(count, target);
+        }
+        java.util.List<Rect> panes = proportionalPanes(count, mode, columnShare(canvas, count, mode), display);
+        if (panes.size() != count) return java.util.Collections.nCopies(count, target);
+        int landscapeMain = -1;
+        if (display.landscape() && count == 3) {
+            panes = inTaskOrder(panes, panePositions(canvas, adapter));
+            landscapeMain = mainPane(canvas, adapter);
+        }
+        int minWidth = Math.round(240f * android.content.res.Resources
+                .getSystem().getDisplayMetrics().density);
+        if (display.landscape()) minWidth = target.width();
+        java.util.ArrayList<Rect> targets = new java.util.ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            Rect pane = panes.get(index);
+            if (index == landscapeMain) {
+                // 扩大应用的逻辑画布，再等比缩回主窗，给内容留出更多空间。
+                float scale = Math.min(1.6f, (float) display.area().width() / pane.width());
+                targets.add(new Rect(0, 0, Math.round(pane.width() * scale),
+                        Math.round(pane.height() * scale)));
+            } else {
+                targets.add(CanvasGeometry.taskBounds(pane, target, minWidth));
+            }
+        }
+        return targets;
+    }
+
+    private static List<Rect> inTaskOrder(List<Rect> panes, int[] order) {
+        if (order == null || order.length != panes.size()) return panes;
+        List<Rect> ordered = new ArrayList<>(order.length);
+        for (int slot : order) ordered.add(panes.get(slot));
+        return ordered;
+    }
 
     private static int statusBarHeight() {
         try {
@@ -1572,23 +2457,38 @@ final class CanvasLayout {
     /** 布局前把 u1/d 缓存统一成目标尺寸。 */
     private static void syncTaskData(Object container) {
         try {
-            Object adapter = fieldOfType(container, "u1.c");
+            Object adapter = CanvasApi.adapter(container);
             if (adapter == null) return;
             containers.put(container, Boolean.TRUE);
             int count = count(adapter);
-            Integer last = taskCounts.get(container);
+            Integer last = taskCounts.put(container, count);
+            if (CanvasApi.isColorOs17() && (last == null || (last == 2) != (count == 2))) {
+                View canvas = (View) container;
+                Object activity = XposedHelpers.callMethod(canvas, "Z2", canvas.getContext());
+                if (activity instanceof Activity host) {
+                    canvas.post(() -> updateCanvasScreenOrientation(host));
+                }
+            }
             boolean justLeftThree = last != null && last >= 3 && count < 3;
             if (last != null && last != count) {
                 layoutKeys.remove(container);
+                if (CanvasApi.isColorOs17()) {
+                    fourZoomed.remove(container);
+                    enlargedPanes.remove(container);
+                    pendingMainSwaps.remove(container);
+                    tasksBySlot.remove(container);
+                    cancelZoom(container);
+                    if (count >= 3) markEnlarged(adapter, count, -1);
+                    else menuShrunk.remove(container);
+                }
                 // 四窗总览是 2×2 的缩放值，关掉一个窗口后画布还停在这个比例上，
                 // 三窗矩形塞不进去画面就是坏的。这里按三窗重新算一次总览。
-                if (last == 4 && count == 3 && !isFourZoomed(container)) {
+                if (!CanvasApi.isColorOs17() && last == 4 && count == 3 && !isFourZoomed(container)) {
                     final Object canvas = container;
                     new android.os.Handler(android.os.Looper.getMainLooper())
                             .post(() -> fitThree(canvas, 0));
                 }
             }
-            taskCounts.put(container, count);
             windowCount = count;
             multiWindowMode = count == 3;
             if (count < 3) {
@@ -1596,9 +2496,9 @@ final class CanvasLayout {
                 if (justLeftThree) restoreTwoSplit(container, adapter, count);
                 return;
             }
-            Rect target = currentTarget();
+            java.util.List<Rect> targets = taskTargets(container, adapter, count);
             for (int i = 0; i < count; i++) {
-                updateTaskData(adapter, i, target);
+                updateTaskData(adapter, i, targets.get(i), true);
             }
         } catch (Throwable error) {
             log("sync taskData failed: " + error);
@@ -1619,7 +2519,7 @@ final class CanvasLayout {
             Rect target = splitSize();
             ClassLoader loader = container.getClass().getClassLoader();
             for (int i = 0; i < count; i++) {
-                Object decor = XposedHelpers.callMethod(container, "q0", i);
+                Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), i);
                 if (decor == null) continue;
                 Object taskView = fieldOfTypeDeep(decor, FLEXIBLE_TASK_VIEW);
                 if (taskView == null) continue;
@@ -1645,7 +2545,7 @@ final class CanvasLayout {
                         XposedHelpers.callMethod(organizer, "applyTransaction", wct);
                     }
                     setLaunchBounds(taskView, target);
-                    updateTaskData(adapter, i, target);
+                    updateTaskData(adapter, i, target, false);
                     log("restore two split " + target.width() + "x" + target.height());
                 } catch (Throwable error) {
                     log("restore two split failed: " + error);
@@ -1657,22 +2557,31 @@ final class CanvasLayout {
     }
 
     private static void forcePhoneSize(Object container) {
+        forcePhoneSize(container, false);
+    }
+
+    private static void forcePhoneSize(Object container, boolean duringLayout) {
         startWatchdog(container);
         boolean pending = false;
         boolean changed = false;
+        boolean fixedPaneSizes = false;
         try {
-            Object adapter = fieldOfType(container, "u1.c");
+            Object adapter = CanvasApi.adapter(container);
             if (adapter == null) return;
             int count = count(adapter);
             windowCount = count;
             multiWindowMode = count == 3;
             if (count < 3) return;
 
-            Rect target = currentTarget();
+            fixedPaneSizes = CanvasApi.isColorOs17()
+                    && (isLandscape((View) container)
+                            || CanvasGeometry.hasPhoneRatioColumns(count, layoutMode(adapter)));
+            java.util.List<Rect> targets = taskTargets(container, adapter, count);
             ClassLoader loader = container.getClass().getClassLoader();
 
             for (int i = 0; i < count; i++) {
-                Object decor = XposedHelpers.callMethod(container, "q0", i);
+                Rect target = targets.get(i);
+                Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), i);
                 if (decor == null) { pending = true; continue; }
                 Object taskView = fieldOfTypeDeep(decor, FLEXIBLE_TASK_VIEW);
                 if (taskView == null) { pending = true; continue; }
@@ -1710,7 +2619,7 @@ final class CanvasLayout {
                         XposedHelpers.callMethod(organizer, "applyTransaction", wct);
                     }
                     setLaunchBounds(taskView, target);
-                    updateTaskData(adapter, i, target);
+                    updateTaskData(adapter, i, target, true);
                     log("phone size " + taskId + " -> " + target.width() + "x" + target.height());
                 } catch (Throwable error) {
                     log("phone size " + taskId + " failed: " + error);
@@ -1720,12 +2629,15 @@ final class CanvasLayout {
             log("phone size pass failed: " + error);
         }
 
-        if (changed && !relayoutScheduled) {
+        if (duringLayout) return;
+        if (changed && fixedPaneSizes) {
+            XposedHelpers.callMethod(container, "z2");
+        } else if (changed && !relayoutScheduled) {
             relayoutScheduled = true;
             new android.os.Handler(android.os.Looper.getMainLooper())
                     .postDelayed(() -> {
                         try {
-                            XposedHelpers.callMethod(container, "N2");
+                            XposedHelpers.callMethod(container, LAYOUT.value());
                         } catch (Throwable error) {
                             log("relayout failed: " + error);
                         } finally {
@@ -1747,10 +2659,10 @@ final class CanvasLayout {
         try {
             Object context = XposedHelpers.callMethod(view, "getContext");
             Object activity = XposedHelpers.callStaticMethod(
-                    XposedHelpers.findClass("B1.l",
-                            view.getClass().getClassLoader()), "O1", context);
+                    XposedHelpers.findClass(UTIL.value(),
+                            view.getClass().getClassLoader()), ACTIVITY_FROM_CONTEXT.value(), context);
             if (activity == null) return null;
-            return XposedHelpers.callMethod(activity, "x0");
+            return XposedHelpers.callMethod(activity, ACTIVITY_VIEW.value());
         } catch (Throwable ignored) {
             return null;
         }
@@ -1778,13 +2690,21 @@ final class CanvasLayout {
     }
 
     /** M1 用的是 u1/d 里缓存的 bounds，改完任务要同步它。 */
-    private static void updateTaskData(Object adapter, int index, Rect target) {
+    private static void updateTaskData(Object adapter, int index, Rect target, boolean proportional) {
         try {
             Object taskData = XposedHelpers.callMethod(adapter, "getItem", index);
             if (taskData == null) return;
             java.lang.reflect.Field field = taskData.getClass().getDeclaredField("a");
             field.setAccessible(true);
-            field.set(taskData, new Rect(target));
+            Rect bounds = new Rect(target);
+            field.set(taskData, bounds);
+            if (CanvasApi.isColorOs17()) {
+                if (proportional) {
+                    XposedHelpers.setAdditionalInstanceField(taskData, PROPORTIONAL_BOUNDS, bounds);
+                } else {
+                    XposedHelpers.removeAdditionalInstanceField(taskData, PROPORTIONAL_BOUNDS);
+                }
+            }
         } catch (Throwable error) {
             log("update taskData failed: " + error);
         }
@@ -1794,14 +2714,14 @@ final class CanvasLayout {
 
     private static void useTabletPolicy(ClassLoader loader) {
         try {
-            Class<?> selector = XposedHelpers.findClass(POLICY_SELECTOR, loader);
+            Class<?> selector = XposedHelpers.findClass(POLICY_SELECTOR.value(), loader);
             XposedHelpers.findAndHookMethod(selector, "b", android.content.Context.class,
                     new XC_MethodHook() {
                         @Override protected void afterHookedMethod(MethodHookParam param) {
                             try {
                                 // 两窗保持原版 PhonePolicy，不能动原版二分屏
                                 if (!multiWindowMode) return;
-                                Object tablet = fieldOfType(param.thisObject, TABLET_POLICY);
+                                Object tablet = fieldOfType(param.thisObject, TABLET_POLICY.value());
                                 if (tablet != null) {
                                     param.setResult(tablet);
                                     log("layout policy -> tablet");
@@ -1819,15 +2739,17 @@ final class CanvasLayout {
 
     private static void forceSplitMode(ClassLoader loader) {
         try {
-            Class<?> policy = XposedHelpers.findClass(TABLET_POLICY, loader);
-            XposedBridge.hookAllMethods(policy, "c", new XC_MethodHook() {
+            Class<?> adapterType = XposedHelpers.findClass(ADAPTER.value(), loader);
+            XC_MethodHook modeHook = new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     try {
                         Object adapter = param.args[0];
                         int count = count(adapter);
                         if (count != 3) return;
                         int mode;
-                        if (forcedMode >= 3 && forcedMode <= 7) {
+                        if (CanvasApi.isColorOs17() && forcedOrientation >= 3 && forcedOrientation <= 7) {
+                            mode = forcedOrientation;
+                        } else if (forcedMode >= 3 && forcedMode <= 7) {
                             mode = forcedMode;
                         } else {
                             Object context = XposedHelpers.callMethod(adapter, "getContext");
@@ -1843,7 +2765,16 @@ final class CanvasLayout {
                         log("split mode failed: " + error);
                     }
                 }
-            });
+            };
+            Class<?> policy = XposedHelpers.findClass(TABLET_POLICY.value(), loader);
+            XposedHelpers.findAndHookMethod(policy, "c", adapterType,
+                    int.class, int.class, boolean.class, modeHook);
+            if (CanvasApi.isColorOs17()) {
+                // 添加第三个任务时，控制器会在布局回调之前用手机策略求拆分模式。
+                Class<?> phone = XposedHelpers.findClass("i2.o", loader);
+                XposedHelpers.findAndHookMethod(phone, "c", adapterType,
+                        int.class, int.class, boolean.class, modeHook);
+            }
             log("split mode hooked");
         } catch (Throwable error) {
             log("split mode unavailable: " + error);
@@ -1852,11 +2783,11 @@ final class CanvasLayout {
 
     private static void allowMoreThanThree(ClassLoader loader) {
         try {
-            Class<?> view = XposedHelpers.findClass(CONTAINER_VIEW, loader);
-            XposedHelpers.findAndHookMethod(view, "i1", new XC_MethodHook() {
+            Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+            XposedHelpers.findAndHookMethod(view, THREE_WINDOWS.value(), new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        Object adapter = fieldOfType(param.thisObject, "u1.c");
+                        Object adapter = CanvasApi.adapter(param.thisObject);
                         if (adapter == null) return;
                         int count = count(adapter);
                         if (count > 3) {
@@ -1876,7 +2807,7 @@ final class CanvasLayout {
 
     private static void ignoreLineLayout(ClassLoader loader) {
         try {
-            Class<?> adapter = XposedHelpers.findClass("u1.c", loader);
+            Class<?> adapter = XposedHelpers.findClass(ADAPTER.value(), loader);
             XposedBridge.hookAllMethods(adapter, "j", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     // 二窗是系统原生分屏，布局方向交给原版
@@ -1937,13 +2868,13 @@ final class CanvasLayout {
     /** 只打关键信息：窗口数、每个窗口的布局矩形。 */
     private static void dumpLayout(Object view) {
         try {
-            Object adapter = fieldOfType(view, "u1.c");
+            Object adapter = CanvasApi.adapter(view);
             int total = adapter == null ? 0 : count(adapter);
             if (total == lastDumpedCount) return;
             lastDumpedCount = total;
             StringBuilder sb = new StringBuilder("layout windows=").append(total);
             for (int i = 0; i < total; i++) {
-                Object decor = XposedHelpers.callMethod(view, "q0", i);
+                Object decor = XposedHelpers.callMethod(view, EMBEDDED_VIEW.value(), i);
                 if (!(decor instanceof android.view.View)) continue;
                 android.view.View d = (android.view.View) decor;
                 sb.append(" [").append(d.getLeft()).append(",").append(d.getTop())
