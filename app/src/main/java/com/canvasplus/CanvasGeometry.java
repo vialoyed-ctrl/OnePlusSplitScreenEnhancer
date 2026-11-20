@@ -76,14 +76,53 @@ final class CanvasGeometry {
         return Math.max(0.25f, Math.min(0.75f, leftShare));
     }
 
+    static List<Rect> twoPanes(int width, int height, int gap, float leftShare,
+                               int secondaryHeight, int mainHeight) {
+        if (width <= gap + 2 || height <= 0) return Collections.emptyList();
+        int leftWidth = Math.round((width - gap) * leftShare);
+        int secondaryTop = (height - secondaryHeight) / 2;
+        int mainTop = (height - mainHeight) / 2;
+        return new ArrayList<>(List.of(
+                new Rect(0, secondaryTop, leftWidth, secondaryTop + secondaryHeight),
+                new Rect(leftWidth + gap, mainTop, width, mainTop + mainHeight)));
+    }
+
+    static List<Rect> twoStackedPanes(int width, int height, int gap, float secondaryShare,
+                                      boolean mainOnTop) {
+        if (width <= 0 || height <= gap + 2) return Collections.emptyList();
+        int secondaryHeight = Math.round((height - gap) * secondaryShare);
+        int mainHeight = height - gap - secondaryHeight;
+        Rect secondary = mainOnTop ? new Rect(0, mainHeight + gap, width, height)
+                : new Rect(0, 0, width, secondaryHeight);
+        Rect main = mainOnTop ? new Rect(0, 0, width, mainHeight)
+                : new Rect(0, secondaryHeight + gap, width, height);
+        return new ArrayList<>(List.of(secondary, main));
+    }
+
     static boolean hasPhoneRatioColumns(int count, int mode) {
-        return count == 4 || (count == 3 && (mode == 6 || mode == 7));
+        return count == 2 || count == 4 || (count == 3 && (mode == 6 || mode == 7));
     }
 
     static int mainPane(int count, int mode) {
-        if (count != 3) return -1;
+        if (count != 2 && count != 3) return -1;
         if (mode == 6) return 0;
-        return mode == 7 ? 2 : -1;
+        return mode == 7 ? count - 1 : -1;
+    }
+
+    /** 移动主窗和小窗组，保留原来的任务槽位、窗格尺寸及组内顺序。 */
+    static void moveMainPaneToOppositeSide(List<Rect> panes, int mainSlot) {
+        Rect main = panes.get(mainSlot);
+        int last = panes.size() - 1;
+        Rect neighbor = panes.get(mainSlot == 0 ? 1 : last - 1);
+        int mainShift = mainSlot == 0
+                ? panes.get(last).right - main.right : panes.get(0).left - main.left;
+        int smallShift = mainSlot == 0
+                ? main.left - neighbor.left : main.right - neighbor.right;
+        for (int slot = 0; slot < panes.size(); slot++) {
+            Rect pane = panes.get(slot);
+            int shift = slot == mainSlot ? mainShift : smallShift;
+            panes.set(slot, new Rect(pane.left + shift, pane.top, pane.right + shift, pane.bottom));
+        }
     }
 
     static boolean swapMainPane(List<?> tasksBySlot, int mode, int selectedSlot) {

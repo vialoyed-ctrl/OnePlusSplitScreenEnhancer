@@ -41,6 +41,9 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
                 SidebarEntry.install(param.classLoader);
                 break;
 
+            case "tv.danmaku.bili":
+                if (param.packageName.equals(param.processName)) BilibiliPlayer.install(param.classLoader);
+                break;
             default:
                 break;
         }

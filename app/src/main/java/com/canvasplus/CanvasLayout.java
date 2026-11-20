@@ -12,10 +12,12 @@ import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Insets;
 import android.graphics.Rect;
+import android.graphics.Region;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowManager;
+import android.widget.ImageView;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -41,10 +43,13 @@ final class CanvasLayout {
     private static final String FLEXIBLE_TASK_VIEW =
             "com.oplus.flexiblewindow.FlexibleTaskView";
     private static final String PROPORTIONAL_BOUNDS = "canvasplus.proportionalBounds";
+    private static final int DIVIDER_BLUE = 0xffa8d7ff;
     static volatile int forcedMode = 0;
     static final int DEFAULT_ORIENTATION = 7;
     /** 7 表示左边两个小窗、右边一个主窗，0 表示交给系统。 */
     static volatile int forcedOrientation = DEFAULT_ORIENTATION;
+    private static final java.util.WeakHashMap<Object, Float> twoColumnShares =
+            new java.util.WeakHashMap<>();
     private static final java.util.WeakHashMap<Object, Float> threeColumnShares =
             new java.util.WeakHashMap<>();
     private static final java.util.WeakHashMap<Object, Float> fourColumnShares =
@@ -58,8 +63,8 @@ final class CanvasLayout {
             new java.util.WeakHashMap<>();
     private static final java.util.WeakHashMap<View, MainPaneSwap> pendingMainSwaps =
             new java.util.WeakHashMap<>();
-    private static final java.util.Set<View> swappingMainPanes =
-            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
+    private static final java.util.WeakHashMap<Object, ValueAnimator> mainPaneAnimations =
+            new java.util.WeakHashMap<>();
     private static int attempts = 0;
     private static volatile boolean relayoutScheduled = false;
     private static final java.util.WeakHashMap<Object, String> layoutKeys =
@@ -77,8 +82,11 @@ final class CanvasLayout {
             int count = count(adapter);
             StringBuilder sb = new StringBuilder();
             sb.append(forcedOrientation).append(':').append(count).append(':');
-            if (CanvasApi.isColorOs17() && count >= 3) {
+            if (CanvasApi.isColorOs17() && count >= 2) {
                 sb.append(canvasArea((View) container)).append(':');
+                if (count <= 3) {
+                    sb.append(preferredMainPaneMode(((View) container).getContext())).append(':');
+                }
             }
             for (int i = 0; i < count; i++) {
                 Object task = XposedHelpers.callMethod(adapter, "getItem", i);
@@ -135,6 +143,7 @@ final class CanvasLayout {
         if (CanvasApi.isColorOs17()) {
             hookModernWindowMenu(loader);
             hookMainPaneSwap(loader);
+            hookPaneResizeTouch(loader);
         } else hookWindowMenu(loader);
         hookFourZoom(loader);
         hookTouchRegion(loader);
@@ -212,7 +221,7 @@ final class CanvasLayout {
     private static void allowFocusedTaskTouch(android.view.View container, Object info) {
         Object adapter = CanvasApi.adapter(container);
         int total = adapter == null ? 0 : count(adapter);
-        if (total < 3) return;
+        if (!usesCanvasLayout(total)) return;
         int focus = (Integer) XposedHelpers.callMethod(adapter, "h");
         if (focus < 0 || focus >= total) return;
         Object decor = XposedHelpers.callMethod(container, EMBEDDED_VIEW.value(), focus);
@@ -228,9 +237,10 @@ final class CanvasLayout {
                 container.getRootView().getHeight())) return;
         android.graphics.Region region = (android.graphics.Region)
                 XposedHelpers.getObjectField(info, "touchableRegion");
-        if (region.isEmpty() || region.quickReject(content)) return;
+        if (region.isEmpty()) return;
         XposedHelpers.callMethod(info, "setTouchableInsets", 3);
         region.op(content, android.graphics.Region.Op.DIFFERENCE);
+        for (PaneEdge edge : resizeEdges(container)) region.op(edge.hit(), Region.Op.UNION);
         Object listener = XposedHelpers.getObjectField(taskView, "mListener");
         if (listener != null) XposedHelpers.callMethod(listener, "updateTouchRegion", region);
     }
@@ -298,7 +308,7 @@ final class CanvasLayout {
                         Object adapter = CanvasApi.adapter(container);
                         if (adapter == null) return;
                         int total = count(adapter);
-                        if (total < 3) return;
+                        if (!usesCanvasLayout(total)) return;
                         boolean enlarge = (Boolean) param.args[2];
                         if (CanvasApi.isColorOs17()) {
                             int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition", param.args[1]);
@@ -344,7 +354,7 @@ final class CanvasLayout {
             Object value = XposedHelpers.callMethod(canvas, "getRectList");
             if (!(value instanceof java.util.List<?> rects) || rects.size() != panes
                     || index < 0 || index >= panes) return;
-            Rect bounds = enlarge ? (Rect) rects.get(index) : contentRect(canvas);
+            Rect bounds = enlarge ? (Rect) rects.get(index) : overviewBounds(canvas, panes);
             if (bounds == null || bounds.isEmpty()) return;
             Rect area = canvasArea(canvas);
             boolean landscape = isLandscape(canvas);
@@ -394,11 +404,462 @@ final class CanvasLayout {
 
     private static final int MAIN_WINDOW_ACTION = 1025;
     private static final int AUTO_MAIN_WINDOW_ACTION = 1026;
+    private static final int MOVE_MAIN_WINDOW_ACTION = 1027;
+    private static final int TWO_PANE_LAYOUT_ACTION = 1028;
+    private static final int STACKED_WINDOW_WIDTH_ACTION = 1029;
     private static final String AUTO_MAIN_WINDOW = "auto_main_window";
+    private static final String MAIN_WINDOW_SIDE = "main_window_side";
+    private static final String STACKED_TWO_PANES = "stacked_two_panes";
+    private static final java.util.WeakHashMap<View, Float> stackedShares = new java.util.WeakHashMap<>();
+    private static final int MIN_STACKED_WIDTH = 30;
+    private static final int MIN_TWO_PANE_HEIGHT = 25;
+    private static final java.util.WeakHashMap<View, PaneEdgeDrag> paneEdgeDrags =
+            new java.util.WeakHashMap<>();
 
     private static boolean autoMainWindow(Context context) {
         return context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
                 .getBoolean(AUTO_MAIN_WINDOW, false);
+    }
+
+    private static int preferredMainPaneMode(Context context) {
+        return context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
+                .getInt(MAIN_WINDOW_SIDE, 0);
+    }
+
+    private static int mainPaneModeOnScreen(View canvas, Object adapter) {
+        int preferred = preferredMainPaneMode(canvas.getContext());
+        return preferred == 0 ? mainPaneMode(canvas, adapter) : preferred;
+    }
+
+    private static boolean isMainPaneReversed(int count, int layoutMode, int preferredMode) {
+        return preferredMode != 0 && preferredMode != layoutMode
+                && CanvasGeometry.mainPane(count, layoutMode) >= 0;
+    }
+
+    private static void moveMainWindow(View canvas, Object adapter) {
+        if (pendingMainSwaps.containsKey(canvas) || mainPaneAnimations.containsKey(canvas)) return;
+        boolean overview = !isFourZoomed(canvas) && !isZoomAnimating(canvas);
+        List<PaneMotion> motions = new ArrayList<>();
+        if (overview) {
+            for (int index = 0; index < count(adapter); index++) {
+                View pane = (View) XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), index);
+                if (pane != null) motions.add(new PaneMotion(pane));
+            }
+        }
+        int target = mainPaneModeOnScreen(canvas, adapter) == 6 ? 7 : 6;
+        canvas.getContext().getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit()
+                .putInt(MAIN_WINDOW_SIDE, target).apply();
+        cancelZoom(canvas);
+        enlargedPanes.remove(canvas);
+        fourZoomed.remove(canvas);
+        markEnlarged(adapter, count(adapter), -1);
+        layoutKeys.remove(canvas);
+        XposedHelpers.callMethod(canvas, "setNeedUpdateFlexibleTaskViewFrameFlag", true);
+        if (!motions.isEmpty()) pendingMainSwaps.put(canvas, new MainPaneSwap(motions));
+        canvas.requestLayout();
+    }
+
+    private static String twoPaneHeightKey(boolean landscape, boolean main) {
+        return "two_pane_height_" + (landscape ? "landscape_" : "portrait_")
+                + (main ? "main" : "secondary");
+    }
+
+    private static boolean stackedTwoPanes(Context context) {
+        return context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
+                .getBoolean(STACKED_TWO_PANES, false);
+    }
+
+    private static void toggleTwoPaneLayout(View canvas, Object adapter) {
+        Context context = canvas.getContext();
+        context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(STACKED_TWO_PANES, !stackedTwoPanes(context)).apply();
+        refreshTwoPaneOverview(canvas, adapter);
+        log("two pane stacked=" + stackedTwoPanes(context));
+    }
+
+    private static void refreshTwoPaneOverview(View canvas, Object adapter) {
+        cancelPaneEdgeDrag(canvas);
+        cancelMainPaneAnimation(canvas);
+        cancelZoom(canvas);
+        enlargedPanes.remove(canvas);
+        fourZoomed.remove(canvas);
+        markEnlarged(adapter, 2, -1);
+        requestPaneLayout(canvas);
+    }
+
+    private static String stackedWidthKey(boolean top) {
+        return top ? "stacked_width_top" : "stacked_width_bottom";
+    }
+
+    private static int stackedWindowWidth(Context context, boolean top) {
+        return context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
+                .getInt(stackedWidthKey(top), 100);
+    }
+
+    private static void saveStackedWindowWidth(Context context, boolean top, int width) {
+        String key = stackedWidthKey(top);
+        var editor = context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit();
+        editor.putInt(key, width);
+        if (width < 100) editor.putInt(key + "_narrow", width);
+        editor.apply();
+        log("stacked window width " + (top ? "top" : "bottom") + "=" + width + "%");
+    }
+
+    private static boolean isTopStackedWindow(View canvas, Object adapter, int index) {
+        int[] order = panePositions(canvas, adapter);
+        int slot = order == null ? index : order[index];
+        return slot == (preferredMainPaneMode(canvas.getContext()) == 6 ? 1 : 0);
+    }
+
+    private static void toggleStackedWindowWidth(View canvas, Object adapter, int index) {
+        Context context = canvas.getContext();
+        boolean top = isTopStackedWindow(canvas, adapter, index);
+        int width = stackedWindowWidth(context, top) < 100 ? 100
+                : context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
+                        .getInt(stackedWidthKey(top) + "_narrow", 50);
+        saveStackedWindowWidth(context, top, width);
+        refreshTwoPaneOverview(canvas, adapter);
+    }
+
+    private record PaneSlot(int count, int mode, boolean landscape, boolean stacked, int index) {}
+
+    private record PaneInsets(float left, float top, float right, float bottom) {
+        static final PaneInsets NONE = new PaneInsets(0, 0, 0, 0);
+
+        Rect apply(Rect slot) {
+            return new Rect(slot.left + Math.round(left * slot.width()),
+                    slot.top + Math.round(top * slot.height()),
+                    slot.right - Math.round(right * slot.width()),
+                    slot.bottom - Math.round(bottom * slot.height()));
+        }
+
+        PaneInsets move(int horizontal, int vertical, float dx, float dy) {
+            return new PaneInsets(horizontal < 0 ? clamp(left + dx, right) : left,
+                    vertical < 0 ? clamp(top + dy, bottom) : top,
+                    horizontal > 0 ? clamp(right - dx, left) : right,
+                    vertical > 0 ? clamp(bottom - dy, top) : bottom);
+        }
+
+        private static float clamp(float value, float opposite) {
+            return Math.max(0f, Math.min(0.60f - opposite, value));
+        }
+    }
+
+    private static final java.util.WeakHashMap<View, java.util.Map<PaneSlot, PaneInsets>> paneInsets =
+            new java.util.WeakHashMap<>();
+
+    private record PaneEdge(Rect hit, int index, boolean main, boolean leftPane, int horizontal,
+                            int vertical, boolean divider) {}
+
+    private static List<PaneEdge> resizeEdges(View canvas) {
+        Object adapter = CanvasApi.adapter(canvas);
+        int count = adapter == null ? 0 : count(adapter);
+        if (count < 2 || count > 4 || isFourZoomed(canvas)
+                || isZoomAnimating(canvas) || mainPaneAnimations.containsKey(canvas)) return List.of();
+        WindowInsets insets = canvas.getRootWindowInsets();
+        if (insets != null && insets.isVisible(WindowInsets.Type.ime())) return List.of();
+        int main = mainPane(canvas, adapter);
+        Rect[] panes = new Rect[count];
+        for (int index = 0; index < panes.length; index++) {
+            View pane = (View) XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), index);
+            if (pane == null || !pane.isShown()) return List.of();
+            Object taskView = XposedHelpers.callMethod(pane, "getFlexibleTaskView");
+            if (taskView == null) return List.of();
+            Rect bounds = (Rect) XposedHelpers.callMethod(taskView, "calculateFrame");
+            if (bounds.isEmpty()) return List.of();
+            panes[index] = bounds;
+        }
+        boolean stacked = count == 2 && stackedTwoPanes(canvas.getContext());
+        float density = canvas.getResources().getDisplayMetrics().density;
+        int radius = Math.round(7 * density);
+        List<PaneEdge> edges = new ArrayList<>(8 * count + 1);
+        if (count == 2) addTwoPaneDivider(edges, panes, stacked, radius, density);
+        for (int index = 0; index < panes.length; index++) {
+            Rect pane = panes[index];
+            boolean first = count == 2 && (stacked ? pane.top < panes[1 - index].top
+                    : pane.left < panes[1 - index].left);
+            boolean isMain = index == main;
+            for (int horizontal : new int[]{-1, 1}) {
+                int hitLeft = horizontal < 0 ? pane.left : pane.right - radius;
+                int hitRight = hitLeft + radius;
+                for (int vertical : new int[]{-1, 1}) {
+                    int y = vertical < 0 ? pane.top : pane.bottom - 1;
+                    edges.add(new PaneEdge(new Rect(hitLeft, y - radius, hitRight, y + radius),
+                            index, isMain, first, horizontal, vertical, false));
+                }
+                edges.add(new PaneEdge(new Rect(hitLeft, pane.top + radius,
+                        hitRight, pane.bottom - radius), index, isMain, first, horizontal, 0, false));
+            }
+            edges.add(new PaneEdge(new Rect(pane.left + radius, pane.top - radius,
+                    pane.right - radius, pane.top + radius), index, isMain, first, 0, -1, false));
+            edges.add(new PaneEdge(new Rect(pane.left + radius, pane.bottom - radius,
+                    pane.right - radius, pane.bottom + radius), index, isMain, first, 0, 1, false));
+        }
+        return edges;
+    }
+
+    private static void addTwoPaneDivider(List<PaneEdge> edges, Rect[] panes, boolean stacked,
+                                         int radius, float density) {
+        boolean firstInOrder = stacked ? panes[0].top < panes[1].top : panes[0].left < panes[1].left;
+        Rect first = panes[firstInOrder ? 0 : 1];
+        Rect second = panes[firstInOrder ? 1 : 0];
+        int start = stacked ? Math.max(first.left, second.left) : Math.max(first.top, second.top);
+        int end = stacked ? Math.min(first.right, second.right) : Math.min(first.bottom, second.bottom);
+        int middle = (start + end) / 2;
+        int dividerRadius = Math.round(32 * density);
+        if (start < end) {
+            int low = Math.max(start, middle - dividerRadius);
+            int high = Math.min(end, middle + dividerRadius);
+            int seam = stacked ? (first.bottom + second.top) / 2 : (first.right + second.left) / 2;
+            Rect hit = stacked ? new Rect(low, seam - radius, high, seam + radius)
+                    : new Rect(seam - radius, low, seam + radius, high);
+            edges.add(new PaneEdge(hit, -1, false, true, stacked ? 0 : 1, stacked ? 1 : 0, true));
+        }
+    }
+
+    private static void hookPaneResizeTouch(ClassLoader loader) {
+        XposedHelpers.findAndHookMethod(Activity.class, "dispatchTouchEvent", MotionEvent.class,
+                new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!CanvasApi.ACTIVITY.equals(param.thisObject.getClass().getName())) return;
+                        View canvas = (View) XposedHelpers.callMethod(param.thisObject, ACTIVITY_VIEW.value());
+                        if (canvas != null && resizeFromPaneEdge(canvas, (MotionEvent) param.args[0], false)) {
+                            param.setResult(true);
+                        }
+                    }
+                });
+
+        Class<?> gestures = XposedHelpers.findClass(CanvasApi.PACKAGE + "A", loader);
+        XposedHelpers.findAndHookMethod(gestures, "T", MotionEvent.class, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                View canvas = (View) XposedHelpers.getObjectField(param.thisObject, "h");
+                MotionEvent event = (MotionEvent) param.args[0];
+                if (canvas == null || !resizeFromPaneEdge(canvas, event, true)) return;
+                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    // 蓝条手势由系统画布的输入监听器独占，后续事件会继续走此入口。
+                    Object host = XposedHelpers.getObjectField(param.thisObject, "b");
+                    XposedHelpers.callMethod(host, "O1");
+                }
+                param.setResult(true);
+            }
+        });
+    }
+
+    private static void hookPaneContentFit(ClassLoader loader) {
+        Class<?> decor = XposedHelpers.findClass(CanvasApi.PACKAGE + "view.EmbeddedViewDecor", loader);
+        XposedHelpers.findAndHookMethod(decor, "onLayout", boolean.class,
+                int.class, int.class, int.class, int.class, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        View pane = (View) param.thisObject;
+                        if (!(pane.getParent() instanceof View canvas)) return;
+                        Object adapter = CanvasApi.adapter(canvas);
+                        if (adapter == null || count(adapter) < 2 || count(adapter) > 4
+                                || Boolean.TRUE.equals(XposedHelpers.callMethod(pane, "K"))) return;
+                        View taskView = (View) XposedHelpers.callMethod(pane, "getFlexibleTaskView");
+                        Rect launch = (Rect) XposedHelpers.callMethod(pane, "getLaunchRect");
+                        if (taskView == null || launch == null || launch.isEmpty()) return;
+                        int left = (Integer) param.args[1];
+                        int top = (Integer) param.args[2];
+                        int width = (Integer) param.args[3] - left;
+                        int height = (Integer) param.args[4] - top;
+                        if (width <= 0 || height <= 0) return;
+                        taskView.layout(0, 0, width, height);
+                        Rect content = new Rect(left, top, left + width, top + height);
+                        Rect target = new Rect(launch);
+                        XposedHelpers.callMethod(pane, "i0", content, target,
+                                XposedHelpers.callMethod(pane, "getTaskData"));
+                        XposedHelpers.callMethod(taskView, "resize", target);
+                        param.setResult(null);
+                    }
+                });
+    }
+
+    private static final class PaneEdgeDrag {
+        final PaneEdge edge;
+        final CanvasDisplay display;
+        final int count;
+        final PaneSlot slot;
+        final Rect slotBounds;
+        final PaneInsets startInsets;
+        final float startX;
+        final float startY;
+        final float startShare;
+        final int startHeight;
+        final int startWidth;
+        final float scale;
+        boolean resizing;
+        int height;
+        int width;
+
+        PaneEdgeDrag(View canvas, PaneEdge edge, MotionEvent event) {
+            this.edge = edge;
+            display = canvasDisplay(canvas);
+            Object adapter = CanvasApi.adapter(canvas);
+            count = count(adapter);
+            int mode = layoutMode(adapter);
+            int index = edge.index();
+            if (index >= 0 && CanvasGeometry.mainPane(count, mainPaneMode(canvas, adapter)) >= 0) {
+                int[] order = panePositions(canvas, adapter);
+                if (order != null) index = order[index];
+            }
+            slot = new PaneSlot(count, mode, display.landscape(), display.stacked(), index);
+            List<Rect> slots = basePanes(count, mode, columnShare(canvas, count, mode), display);
+            slotBounds = index >= 0 && index < slots.size() ? slots.get(index) : new Rect();
+            var saved = paneInsets.get(canvas);
+            startInsets = saved == null ? PaneInsets.NONE : saved.getOrDefault(slot, PaneInsets.NONE);
+            startX = event.getRawX();
+            startY = event.getRawY();
+            startShare = display.stacked() ? display.stackedShare() : columnShare(canvas, 2, DEFAULT_ORIENTATION);
+            startHeight = twoPaneHeightPercent(display, edge.main());
+            height = startHeight;
+            startWidth = display.stacked() && !edge.divider()
+                    ? stackedWindowWidth(canvas.getContext(), edge.leftPane()) : 100;
+            width = startWidth;
+            scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
+            resizing = !edge.divider();
+        }
+    }
+
+    private static boolean resizeFromPaneEdge(View canvas, MotionEvent event, boolean dividerStream) {
+        int action = event.getActionMasked();
+        PaneEdgeDrag drag = paneEdgeDrags.get(canvas);
+        if (action == MotionEvent.ACTION_DOWN) {
+            for (PaneEdge edge : resizeEdges(canvas)) {
+                if (edge.hit().contains((int) event.getRawX(), (int) event.getRawY())) {
+                    if (edge.divider() != dividerStream) return false;
+                    paneEdgeDrags.put(canvas, new PaneEdgeDrag(canvas, edge, event));
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (drag == null || drag.edge.divider() != dividerStream) return false;
+        if (!drag.resizing) {
+            int slop = android.view.ViewConfiguration.get(canvas.getContext()).getScaledTouchSlop();
+            float distance = drag.display.stacked() ? event.getRawY() - drag.startY : event.getRawX() - drag.startX;
+            if (action == MotionEvent.ACTION_MOVE && Math.abs(distance) > slop) {
+                drag.resizing = true;
+            } else {
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL
+                        || action == MotionEvent.ACTION_POINTER_DOWN) {
+                    paneEdgeDrags.remove(canvas);
+                    if (action == MotionEvent.ACTION_UP && edgeContainsTap(drag, event, slop)) {
+                        showTwoPaneDividerMenu(canvas, event);
+                    }
+                }
+                return true;
+            }
+        }
+        if (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP) {
+            updatePaneEdgeSize(canvas, drag, event);
+        }
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL
+                || action == MotionEvent.ACTION_POINTER_DOWN) {
+            paneEdgeDrags.remove(canvas);
+            if (action == MotionEvent.ACTION_UP) {
+                if (drag.count == 2 && !drag.display.stacked() && drag.height != drag.startHeight) {
+                    canvas.getContext().getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit()
+                            .putInt(twoPaneHeightKey(drag.display.landscape(), drag.edge.main()), drag.height)
+                            .apply();
+                }
+                if (drag.display.stacked() && drag.width != drag.startWidth) {
+                    saveStackedWindowWidth(canvas.getContext(), drag.edge.leftPane(), drag.width);
+                }
+                log("window resize count=" + drag.count + " stacked=" + drag.display.stacked()
+                        + " pane=" + drag.edge.index() + " divider=" + drag.edge.divider());
+            } else {
+                restorePaneSize(canvas, drag);
+            }
+            requestPaneLayout(canvas);
+        }
+        return true;
+    }
+
+    private static boolean edgeContainsTap(PaneEdgeDrag drag, MotionEvent event, int slop) {
+        return Math.abs(event.getRawX() - drag.startX) <= slop
+                && Math.abs(event.getRawY() - drag.startY) <= slop;
+    }
+
+    private static void showTwoPaneDividerMenu(View canvas, MotionEvent event) {
+        Object bar = fieldOfTypeDeep(canvas, SPLIT_BAR.value());
+        Object handle = bar == null ? null : XposedHelpers.callMethod(bar, "X", event);
+        if (handle != null) XposedHelpers.callMethod(bar, "q0", handle);
+    }
+
+    private static void updatePaneEdgeSize(View canvas, PaneEdgeDrag drag, MotionEvent event) {
+        if (drag.scale <= 0f || drag.display.availableHeight() <= 0) return;
+        if (drag.count >= 3) {
+            if (drag.slotBounds.isEmpty()) return;
+            float dx = (event.getRawX() - drag.startX) / (drag.slotBounds.width() * drag.scale);
+            float dy = (event.getRawY() - drag.startY) / (drag.slotBounds.height() * drag.scale);
+            PaneInsets resize = drag.startInsets.move(drag.edge.horizontal(), drag.edge.vertical(), dx, dy);
+            if (setPaneInsets(canvas, drag.slot, resize)) requestPaneLayout(canvas);
+            return;
+        }
+        if (drag.display.stacked()) {
+            int previousWidth = drag.width;
+            if (drag.edge.horizontal() != 0 && !drag.slotBounds.isEmpty()) {
+                float dx = (event.getRawX() - drag.startX) / (drag.slotBounds.width() * drag.scale);
+                int width = drag.startWidth + Math.round(200f * drag.edge.horizontal() * dx);
+                drag.width = Math.max(MIN_STACKED_WIDTH, Math.min(100, width));
+            }
+            boolean changed = drag.width != previousWidth;
+            if (drag.edge.vertical() == 0) {
+                if (changed) requestPaneLayout(canvas);
+                return;
+            }
+            float direction = drag.display.preferredMainPaneMode() == 6 ? -1f : 1f;
+            if (!drag.edge.leftPane()) direction = -direction;
+            float share = CanvasGeometry.clampLeftShare(drag.startShare + direction * drag.edge.vertical()
+                    * (event.getRawY() - drag.startY) / ((drag.display.availableHeight() - columnGap()) * drag.scale));
+            if (share != stackedShares.getOrDefault(canvas, 1f / 3f)) {
+                stackedShares.put(canvas, share);
+                changed = true;
+            }
+            if (changed) requestPaneLayout(canvas);
+            return;
+        }
+        int beforeHeight = drag.height;
+        int heightChange = Math.round(drag.edge.vertical() * 200f * (event.getRawY() - drag.startY)
+                / (drag.display.availableHeight() * drag.scale));
+        drag.height = Math.max(MIN_TWO_PANE_HEIGHT, Math.min(100, drag.startHeight + heightChange));
+        if (drag.edge.horizontal() != 0) {
+            float direction = drag.display.preferredMainPaneMode() == 6 ? -1f : 1f;
+            if (!drag.edge.leftPane()) direction = -direction;
+            int width = drag.display.area().width() - columnGap();
+            if (width > 0) {
+                float delta = direction * drag.edge.horizontal() * (event.getRawX() - drag.startX)
+                        / (width * drag.scale);
+                resizeTwoPaneColumns(canvas, CanvasGeometry.clampLeftShare(drag.startShare + delta));
+            }
+        }
+        if (drag.height != beforeHeight) requestPaneLayout(canvas);
+    }
+
+    private static boolean setPaneInsets(View canvas, PaneSlot slot, PaneInsets insets) {
+        var saved = paneInsets.computeIfAbsent(canvas, ignored -> new java.util.HashMap<>());
+        PaneInsets old = saved.getOrDefault(slot, PaneInsets.NONE);
+        if (insets.equals(PaneInsets.NONE)) saved.remove(slot);
+        else saved.put(slot, insets);
+        return !insets.equals(old);
+    }
+
+    private static void restorePaneSize(View canvas, PaneEdgeDrag drag) {
+        if (drag.count >= 3 && !drag.slotBounds.isEmpty()) setPaneInsets(canvas, drag.slot, drag.startInsets);
+        if (drag.display.stacked()) stackedShares.put(canvas, drag.startShare);
+        else if (drag.count == 2) twoColumnShares.put(canvas, drag.startShare);
+    }
+
+    private static void resizeTwoPaneColumns(View canvas, float share) {
+        if (share == columnShare(canvas, 2, DEFAULT_ORIENTATION)) return;
+        twoColumnShares.put(canvas, share);
+        requestPaneLayout(canvas);
+    }
+
+    private static void requestPaneLayout(View canvas) {
+        layoutKeys.remove(canvas);
+        XposedHelpers.callMethod(canvas, "setNeedUpdateFlexibleTaskViewFrameFlag", true);
+        canvas.requestLayout();
     }
 
     private static void hookModernWindowMenu(ClassLoader loader) {
@@ -413,7 +874,7 @@ final class CanvasLayout {
                     Object owner = param.thisObject;
                     View canvas = (View) XposedHelpers.getObjectField(owner, "n");
                     Object adapter = CanvasApi.adapter(canvas);
-                    if (adapter == null || count(adapter) < 3) return;
+                    if (adapter == null || count(adapter) < 2) return;
                     int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition",
                             XposedHelpers.getObjectField(owner, "o"));
                     if (index < 0) return;
@@ -431,10 +892,30 @@ final class CanvasLayout {
                     if (main >= 0) {
                         items.add(1, autoMainMenuItem(builder, canvas.getContext(),
                                 autoMainWindow(canvas.getContext())));
-                    }
-                    if (main >= 0 && main != index) {
-                        items.add(2, windowMenuItem(builder, "设为主窗口", MAIN_WINDOW_ACTION,
-                                android.R.drawable.btn_star_big_off));
+                        boolean onLeft = mainPaneModeOnScreen(canvas, adapter) == 6;
+                        boolean stacked = count(adapter) == 2 && stackedTwoPanes(canvas.getContext());
+                        items.add(2, windowMenuItem(builder,
+                                stacked ? (onLeft ? "主屏移到下方" : "主屏移到上方")
+                                        : (onLeft ? "主屏移到右边" : "主屏移到左边"),
+                                MOVE_MAIN_WINDOW_ACTION,
+                                android.R.drawable.ic_menu_sort_by_size));
+                        if (main != index) {
+                            items.add(3, windowMenuItem(builder, "设为主窗口", MAIN_WINDOW_ACTION,
+                                    android.R.drawable.btn_star_big_off));
+                        }
+                        if (count(adapter) == 2) {
+                            int layoutRow = main == index ? 3 : 4;
+                            items.add(layoutRow, windowMenuItem(builder,
+                                    stacked ? "切换为左右布局" : "切换为上下布局",
+                                    TWO_PANE_LAYOUT_ACTION, android.R.drawable.ic_menu_sort_by_size));
+                            if (stacked) {
+                                boolean top = isTopStackedWindow(canvas, adapter, index);
+                                int width = stackedWindowWidth(canvas.getContext(), top);
+                                items.add(layoutRow + 1, windowMenuItem(builder,
+                                        width == 100 ? "切换为窄窗口" : "切换为宽窗口",
+                                        STACKED_WINDOW_WIDTH_ACTION, android.R.drawable.ic_menu_crop));
+                            }
+                        }
                     }
                 }
             });
@@ -447,7 +928,9 @@ final class CanvasLayout {
                             int row = (Integer) param.args[2];
                             if (row < 0 || row >= items.size()) return;
                             int action = (Integer) XposedHelpers.callMethod(items.get(row), "m");
-                            if (action != MAIN_WINDOW_ACTION && action != AUTO_MAIN_WINDOW_ACTION) return;
+                            if (action != MAIN_WINDOW_ACTION && action != AUTO_MAIN_WINDOW_ACTION
+                                    && action != MOVE_MAIN_WINDOW_ACTION && action != TWO_PANE_LAYOUT_ACTION
+                                    && action != STACKED_WINDOW_WIDTH_ACTION) return;
                             param.setResult(null);
                             View canvas = (View) XposedHelpers.getObjectField(owner, "n");
                             Object task = XposedHelpers.getObjectField(owner, "o");
@@ -455,18 +938,32 @@ final class CanvasLayout {
                             if (adapter == null || mainPane(canvas, adapter) < 0) return;
                             android.widget.PopupWindow popup = (android.widget.PopupWindow)
                                     XposedHelpers.getObjectField(owner, "p");
+                            popup.dismiss();
                             if (action == AUTO_MAIN_WINDOW_ACTION) {
                                 Context context = canvas.getContext();
                                 boolean enabled = !autoMainWindow(context);
                                 context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit()
                                         .putBoolean(AUTO_MAIN_WINDOW, enabled).apply();
-                                popup.dismiss();
                                 log("auto main window " + (enabled ? "on" : "off"));
                                 return;
                             }
-                            popup.dismiss();
+                            if (action == MOVE_MAIN_WINDOW_ACTION) {
+                                moveMainWindow(canvas, adapter);
+                                return;
+                            }
+                            if (action == TWO_PANE_LAYOUT_ACTION) {
+                                if (count(adapter) == 2) toggleTwoPaneLayout(canvas, adapter);
+                                return;
+                            }
                             int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition", task);
-                            if (index >= 0) selectMainPane(canvas, adapter, index);
+                            if (index < 0) return;
+                            if (action == STACKED_WINDOW_WIDTH_ACTION) {
+                                if (count(adapter) == 2 && stackedTwoPanes(canvas.getContext())) {
+                                    toggleStackedWindowWidth(canvas, adapter, index);
+                                }
+                                return;
+                            }
+                            selectMainPane(canvas, adapter, index);
                         }
                     });
             log("modern window menu hooked");
@@ -540,7 +1037,7 @@ final class CanvasLayout {
     }
 
     private static boolean selectMainPane(View canvas, Object adapter, int index) {
-        if (pendingMainSwaps.containsKey(canvas) || swappingMainPanes.contains(canvas)) return false;
+        if (pendingMainSwaps.containsKey(canvas) || mainPaneAnimations.containsKey(canvas)) return false;
         int main = mainPane(canvas, adapter);
         if (main < 0 || main == index) return false;
         List<Object> slots = paneOrder(canvas, adapter);
@@ -553,7 +1050,7 @@ final class CanvasLayout {
         cancelZoom(canvas);
         if (overview && selected != null && previous != null) {
             pendingMainSwaps.put(canvas, new MainPaneSwap(
-                    new PaneMotion(selected), new PaneMotion(previous)));
+                    List.of(new PaneMotion(selected), new PaneMotion(previous))));
         }
         enlargedPanes.remove(canvas);
         fourZoomed.remove(canvas);
@@ -578,6 +1075,9 @@ final class CanvasLayout {
                     if (adapter == null || CanvasGeometry.mainPane(count(adapter), mainPaneMode(canvas, adapter)) < 0
                             || !autoMainWindow(canvas.getContext()) || isFourZoomed(canvas)
                             || XposedHelpers.getBooleanField(canvas, "T")) return;
+                    for (PaneEdge edge : resizeEdges(canvas)) {
+                        if (edge.hit().contains((int) touch.getRawX(), (int) touch.getRawY())) return;
+                    }
                     int index = XposedHelpers.getIntField(param.thisObject, "o");
                     if (index < 0 || index >= count(adapter) || index == mainPane(canvas, adapter)) return;
                     int x = (int) touch.getRawX();
@@ -616,32 +1116,41 @@ final class CanvasLayout {
         }
     }
 
-    private record MainPaneSwap(PaneMotion selected, PaneMotion previous) {
+    private static void cancelMainPaneAnimation(Object canvas) {
+        pendingMainSwaps.remove(canvas);
+        ValueAnimator animation = mainPaneAnimations.remove(canvas);
+        if (animation != null) animation.cancel();
+    }
+
+    private record MainPaneSwap(List<PaneMotion> panes) {
         void start(View canvas) {
-            if (!selected.prepare(canvas) || !previous.prepare(canvas)) return;
-            swappingMainPanes.add(canvas);
-            selected.apply(0f);
-            previous.apply(0f);
+            List<PaneMotion> moving = new ArrayList<>(panes.size());
+            for (PaneMotion pane : panes) {
+                if (pane.prepare(canvas)) moving.add(pane);
+            }
+            if (moving.isEmpty()) return;
+            Object adapter = CanvasApi.adapter(canvas);
+            boolean uniform = adapter != null && count(adapter) == 2;
             ValueAnimator animation = ValueAnimator.ofFloat(0f, 1f);
             animation.setDuration(260);
             animation.setInterpolator(new android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f));
             animation.addUpdateListener(animator -> {
                 float progress = (Float) animator.getAnimatedValue();
-                selected.apply(progress);
-                previous.apply(progress);
+                for (PaneMotion pane : moving) pane.apply(progress, uniform);
             });
             animation.addListener(new android.animation.AnimatorListenerAdapter() {
                 @Override public void onAnimationEnd(android.animation.Animator animator) {
-                    selected.reset();
-                    previous.reset();
-                    swappingMainPanes.remove(canvas);
-                    if (canvas.isAttachedToWindow()) {
+                    for (PaneMotion pane : moving) pane.reset();
+                    if (mainPaneAnimations.remove(canvas, animation) && canvas.isAttachedToWindow()) {
                         XposedHelpers.callMethod(canvas, "z2");
                         XposedHelpers.callMethod(canvas, "v2");
                         log("main pane swap animation finished");
                     }
                 }
             });
+            mainPaneAnimations.put(canvas, animation);
+            for (PaneMotion pane : moving) pane.apply(0f, uniform);
+            log("main pane swap animation started panes=" + moving.size());
             animation.start();
         }
     }
@@ -671,21 +1180,24 @@ final class CanvasLayout {
             return pane.getParent() == canvas && !start.isEmpty() && !end.isEmpty() && !start.equals(end);
         }
 
-        void apply(float progress) {
+        void apply(float progress, boolean uniform) {
             float remaining = 1f - progress;
             // 从交换前的窗格边缘移动到交换后的边缘。
             float scaleX = 1f + ((float) start.width() / end.width() - 1f) * remaining;
             float scaleY = 1f + ((float) start.height() / end.height() - 1f) * remaining;
+            if (uniform) scaleX = scaleY = Math.min(scaleX, scaleY);
             pane.setPivotX(0f);
             pane.setPivotY(0f);
             pane.setScaleX(scaleX);
             pane.setScaleY(scaleY);
-            pane.setTranslationX((start.left - end.left) * remaining);
-            pane.setTranslationY((start.top - end.top) * remaining);
+            pane.setTranslationX((start.exactCenterX() - end.exactCenterX()) * remaining
+                    + end.width() * (1f - scaleX) / 2f);
+            pane.setTranslationY((start.exactCenterY() - end.exactCenterY()) * remaining
+                    + end.height() * (1f - scaleY) / 2f);
         }
 
         void reset() {
-            apply(1f);
+            apply(1f, false);
             if (pivotSet) {
                 pane.setPivotX(pivotX);
                 pane.setPivotY(pivotY);
@@ -731,16 +1243,12 @@ final class CanvasLayout {
     private static Rect contentRect(Object container) {
         try {
             Object rects = XposedHelpers.callMethod(container, "getRectList");
-            if (!(rects instanceof java.util.List)) return null;
+            if (!(rects instanceof List<?> panes)) return null;
             Rect union = new Rect();
-            boolean any = false;
-            for (Object item : (java.util.List<?>) rects) {
-                if (item instanceof Rect) {
-                    union.union((Rect) item);
-                    any = true;
-                }
+            for (Object item : panes) {
+                if (item instanceof Rect pane) union.union(pane);
             }
-            return any ? union : null;
+            return union.isEmpty() ? null : union;
         } catch (Throwable error) {
             return null;
         }
@@ -979,10 +1487,29 @@ final class CanvasLayout {
                 - (canvas.getTop() + union.top) * scale;
     }
 
+    private static Rect overviewBounds(View canvas, int count) {
+        var saved = paneInsets.get(canvas);
+        if (saved == null || saved.isEmpty()) return contentRect(canvas);
+        Object adapter = CanvasApi.adapter(canvas);
+        if (adapter == null) return contentRect(canvas);
+        int mode = layoutMode(adapter);
+        CanvasDisplay display = canvasDisplay(canvas);
+        for (PaneInsets insets : display.paneInsets()) {
+            if (insets == null) continue;
+            // 缩小单窗时仍用原来的总览坐标，其他窗格不随拖动平移。
+            Rect union = new Rect();
+            for (Rect slot : basePanes(count, mode, columnShare(canvas, count, mode), display)) {
+                union.union(slot);
+            }
+            if (!union.isEmpty()) return union;
+        }
+        return contentRect(canvas);
+    }
+
     /** 在同一次布局里提交窗格和画布坐标，避免新窗格先用上一套平移量画一帧。 */
     private static void applyOverview(View canvas, int panes) {
         if (!(canvas.getParent() instanceof View parent)) return;
-        Rect union = contentRect(canvas);
+        Rect union = overviewBounds(canvas, panes);
         if (union == null) return;
         Rect area = canvasArea(canvas);
         boolean landscape = isLandscape(canvas);
@@ -1290,6 +1817,11 @@ final class CanvasLayout {
                                 Object input = param.args[1];
                                 if (!(input instanceof java.util.List)) return;
                                 java.util.List<?> list = (java.util.List<?>) input;
+                                if (CanvasApi.isColorOs17() && list.size() == 2 && !(Boolean) param.args[5]) {
+                                    List<Rect> panes = twoPaneTransitionBounds(loader, (Context) param.args[0]);
+                                    if (panes.size() == 2) param.setResult(panes);
+                                    return;
+                                }
                                 if (list.size() != 4) return;
                                 if (result instanceof java.util.List
                                         && !((java.util.List<?>) result).isEmpty()) return;
@@ -1302,6 +1834,32 @@ final class CanvasLayout {
         } catch (Throwable error) {
             log("layout calc hook failed: " + error);
         }
+    }
+
+    private static List<Rect> twoPaneTransitionBounds(ClassLoader loader, Context context) {
+        Class<?> util = XposedHelpers.findClass(UTIL.value(), loader);
+        Object host = XposedHelpers.callStaticMethod(util, ACTIVITY_FROM_CONTEXT.value(), context);
+        if (host == null) return List.of();
+        View canvas = (View) XposedHelpers.callMethod(host, ACTIVITY_VIEW.value());
+        if (canvas == null) return List.of();
+        Object adapter = CanvasApi.adapter(canvas);
+        CanvasDisplay display = canvasDisplay(canvas);
+        int mode = DEFAULT_ORIENTATION;
+        List<Rect> panes = proportionalPanes(2, mode, columnShare(canvas, 2, mode), display);
+        if (panes.size() != 2) return panes;
+
+        Rect union = new Rect();
+        for (Rect pane : panes) union.union(pane);
+        int x = display.area().centerX() - union.centerX();
+        int y = display.area().centerY() - union.centerY();
+        // 系统的遮罩调用方会补上状态栏偏移。
+        Class<?> policy = XposedHelpers.findClass("i2.s", loader);
+        if (Boolean.TRUE.equals(XposedHelpers.callStaticMethod(policy, "C"))) {
+            y -= (Integer) XposedHelpers.callMethod(host, "T0");
+        }
+        for (Rect pane : panes) pane.offset(x, y);
+        return adapter != null && count(adapter) == 2
+                ? inTaskOrder(panes, panePositions(canvas, adapter)) : panes;
     }
 
     /**
@@ -1336,7 +1894,8 @@ final class CanvasLayout {
                                 View pane = (View) param.thisObject;
                                 if (!(pane.getParent() instanceof View canvas)) return;
                                 Object adapter = CanvasApi.adapter(canvas);
-                                if (adapter == null || count(adapter) != 3) return;
+                                int total = adapter == null ? 0 : count(adapter);
+                                if (total != 2 && total != 3) return;
                                 Rect requested = (Rect) param.args[0];
                                 Rect launch = (Rect) XposedHelpers.callMethod(pane, "getLaunchRect");
                                 if (requested == null || requested.isEmpty() || launch == null
@@ -1390,6 +1949,23 @@ final class CanvasLayout {
             log("native four layout hook failed: " + error);
         }
 
+        if (CanvasApi.isColorOs17()) {
+            try {
+                hookPaneContentFit(loader);
+                Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
+                XposedHelpers.findAndHookMethod(view, "X2", new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        Object adapter = CanvasApi.adapter(param.thisObject);
+                        if (adapter == null || count(adapter) != 2) return;
+                        XposedHelpers.callMethod(param.thisObject, LAYOUT.value());
+                        param.setResult(null);
+                    }
+                });
+            } catch (Throwable error) {
+                log("two pane layout hook failed: " + error);
+            }
+        }
+
         // N2() 会往 getRectList() 里 addAll，但只有 w1() 会先清。resume、
         // 直接调 N2 的路径没清，矩形会累加到 6、9 个，交换和调节条全错位。
         try {
@@ -1425,8 +2001,9 @@ final class CanvasLayout {
                         Object input = param.args[0];
                         if (!(input instanceof java.util.List)) return;
                         int count = ((java.util.List<?>) input).size();
-                        if (CanvasApi.isColorOs17() && (count == 3 || count == 4)) {
-                            int mode = (Integer) param.args[1];
+                        if (CanvasApi.isColorOs17() && (count == 3 || count == 4
+                                || (count == 2 && layoutDisplay.get() != null))) {
+                            int mode = count == 2 ? DEFAULT_ORIENTATION : (Integer) param.args[1];
                             Float share = layoutColumnShare.get();
                             CanvasDisplay display = layoutDisplay.get();
                             if (display == null) display = fallbackCanvasDisplay();
@@ -1638,7 +2215,7 @@ final class CanvasLayout {
     }
 
     /**
-     * 总览中沿用系统分隔条的手势，拖动时预览分隔线，松手时提交窗格尺寸。
+     * 双窗拖动时更新应用布局，其他布局松手时提交窗格尺寸。
      */
     private static void hookDragLock(ClassLoader loader) {
         try {
@@ -1654,7 +2231,7 @@ final class CanvasLayout {
                                 Object container = XposedHelpers.getObjectField(
                                         param.thisObject, "h");
                                 Object adapter = CanvasApi.adapter(container);
-                                if (adapter != null && count(adapter) >= 3) {
+                                if (adapter != null && usesCanvasLayout(count(adapter))) {
                                     param.setResult(null);
                                     if (CanvasApi.isColorOs17()) {
                                         previewColumnDrag(param.thisObject, (View) container, adapter,
@@ -1675,7 +2252,7 @@ final class CanvasLayout {
                                 Object container = XposedHelpers.getObjectField(
                                         param.thisObject, "h");
                                 Object adapter = CanvasApi.adapter(container);
-                                if (adapter != null && count(adapter) >= 3) {
+                                if (adapter != null && usesCanvasLayout(count(adapter))) {
                                     param.setResult(null);
                                 }
                             } catch (Throwable ignored) {
@@ -1686,6 +2263,7 @@ final class CanvasLayout {
                 hookColumnDragEnd(loader, bar);
                 hookColumnHandles(bar);
                 hookWindowHeaderDrag(loader);
+                hookTwoPaneDividerMenu(bar, item);
             }
             log("drag lock hooked");
         } catch (Throwable error) {
@@ -1693,19 +2271,55 @@ final class CanvasLayout {
         }
     }
 
+    private static void hookTwoPaneDividerMenu(Class<?> bar, Class<?> item) {
+        XposedHelpers.findAndHookMethod(bar, "U", item, new XC_MethodHook() {
+            @Override protected void afterHookedMethod(MethodHookParam param) {
+                Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
+                Object adapter = CanvasApi.adapter(canvas);
+                if (adapter == null || count(adapter) != 2) return;
+                List<Object> items = (List<Object>) XposedHelpers.getObjectField(param.thisObject, "K");
+                items.removeIf(entry -> {
+                    int action = (Integer) XposedHelpers.callMethod(entry, "m");
+                    return action == 3 || action == 4;
+                });
+            }
+        });
+    }
+
     private static void hookColumnHandles(Class<?> bar) {
         XposedHelpers.findAndHookMethod(bar, "w", Rect.class, Rect.class, new XC_MethodHook() {
+            @Override protected void afterHookedMethod(MethodHookParam param) {
+                Object handle = param.getResult();
+                if (handle == null) return;
+                ImageView icon = (ImageView) XposedHelpers.callMethod(handle, "h");
+                if (icon != null) icon.setImageTintList(ColorStateList.valueOf(DIVIDER_BLUE));
+            }
+
             @Override protected void beforeHookedMethod(MethodHookParam param) {
                 Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
                 Object adapter = CanvasApi.adapter(canvas);
-                if (adapter == null || count(adapter) < 3) return;
+                if (adapter == null || count(adapter) < 2) return;
                 Rect first = (Rect) param.args[0];
                 Rect second = (Rect) param.args[1];
+                if (count(adapter) == 2 && stackedTwoPanes(((View) canvas).getContext())) {
+                    int left = Math.max(first.left, second.left);
+                    int right = Math.min(first.right, second.right);
+                    if (left >= right) param.setResult(null);
+                    else {
+                        param.args[0] = new Rect(left, first.top, right, first.bottom);
+                        param.args[1] = new Rect(left, second.top, right, second.bottom);
+                    }
+                    return;
+                }
                 if (isLandscape((View) canvas)) {
                     int main = mainPane(canvas, adapter);
                     List<?> panes = (List<?>) XposedHelpers.callMethod(canvas, "getRectList");
-                    if (main < 0 || panes.size() <= main
-                            || Math.max(first.left, second.left) != ((Rect) panes.get(main)).left) {
+                    if (main < 0 || panes.size() <= main) {
+                        param.setResult(null);
+                        return;
+                    }
+                    int mainLeft = ((Rect) panes.get(main)).left;
+                    if (mainLeft != first.left && mainLeft != second.left) {
                         param.setResult(null);
                     }
                     return;
@@ -1733,7 +2347,7 @@ final class CanvasLayout {
                     @Override protected void beforeHookedMethod(MethodHookParam param) {
                         Object canvas = XposedHelpers.getObjectField(param.thisObject, "n");
                         Object adapter = CanvasApi.adapter(canvas);
-                        if (adapter != null && count(adapter) >= 3) {
+                        if (adapter != null && count(adapter) >= 2) {
                             // 多窗通过分隔条调节，标题按钮继续走原生点击菜单。
                             param.setResult(Boolean.FALSE);
                         }
@@ -1745,10 +2359,14 @@ final class CanvasLayout {
             new java.util.WeakHashMap<>();
 
     private record ColumnDrag(View canvas, View handle, long downTime, int panes, int mode,
-                              boolean landscape, float initialShare, float screenWidth) {
+                              boolean landscape, boolean reversed, float initialShare, float screenWidth) {
         float shareAt(MotionEvent event, float startX) {
             return CanvasGeometry.clampLeftShare(initialShare
-                    + (event.getRawX() - startX) / screenWidth);
+                    + direction() * (event.getRawX() - startX) / screenWidth);
+        }
+
+        int direction() {
+            return reversed ? -1 : 1;
         }
 
         void clearPreview() {
@@ -1759,8 +2377,11 @@ final class CanvasLayout {
     private static void previewColumnDrag(Object bar, View canvas, Object adapter, Object item,
                                           MotionEvent start, MotionEvent current) {
         int total = count(adapter);
+        if (total == 2) return;
         int mode = layoutMode(adapter);
         boolean landscape = isLandscape(canvas);
+        boolean reversed = isMainPaneReversed(total, landscape ? DEFAULT_ORIENTATION : mode,
+                preferredMainPaneMode(canvas.getContext()));
         if (isFourZoomed(canvas) || current.getPointerCount() != 1
                 || (landscape ? total != 3 : !CanvasGeometry.hasPhoneRatioColumns(total, mode))
                 || !Boolean.TRUE.equals(XposedHelpers.callMethod(item, "k"))) return;
@@ -1768,20 +2389,20 @@ final class CanvasLayout {
         ColumnDrag drag = columnDrags.get(bar);
         if (drag == null || drag.downTime() != start.getDownTime()) {
             if (drag != null) drag.clearPreview();
+            float scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
             Rect bounds = contentRect(canvas);
             if (bounds == null) return;
-            float scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
             int width = bounds.width() - columnGap() * (landscape ? 2 : 1);
             if (width <= 0 || scale <= 0f) return;
             View handle = (View) XposedHelpers.callMethod(item, "g");
             drag = new ColumnDrag(canvas, handle, start.getDownTime(), total, mode,
-                    landscape, columnShare(canvas, total, mode), width * scale);
+                    landscape, reversed, columnShare(canvas, total, mode), width * scale);
             columnDrags.put(bar, drag);
         }
         float scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
         if (scale > 0f) {
             float shift = (drag.shareAt(current, start.getRawX()) - drag.initialShare())
-                    * drag.screenWidth() / scale;
+                    * drag.direction() * drag.screenWidth() / scale;
             drag.handle().setTranslationX(shift);
         }
     }
@@ -1793,7 +2414,7 @@ final class CanvasLayout {
                         try {
                             Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
                             Object adapter = CanvasApi.adapter(canvas);
-                            if (adapter == null || count(adapter) < 3) return;
+                            if (adapter == null || count(adapter) < 2) return;
                             param.setResult(null);
                             ColumnDrag drag = columnDrags.remove(param.thisObject);
                             if (drag == null) return;
@@ -1803,7 +2424,10 @@ final class CanvasLayout {
                                     || end.getDownTime() != drag.downTime()
                                     || count(adapter) != drag.panes() || isFourZoomed(canvas)
                                     || isLandscape(drag.canvas()) != drag.landscape()
-                                    || layoutMode(adapter) != drag.mode()) return;
+                                    || layoutMode(adapter) != drag.mode()
+                                    || drag.reversed() != isMainPaneReversed(drag.panes(),
+                                            drag.landscape() ? DEFAULT_ORIENTATION : drag.mode(),
+                                            preferredMainPaneMode(drag.canvas().getContext()))) return;
                             float share = drag.shareAt(end, (Integer) param.args[1]);
                             if (Math.abs(share - drag.initialShare()) < 0.002f) return;
                             columnShares(drag.canvas(), drag.panes()).put(canvas, share);
@@ -1884,8 +2508,7 @@ final class CanvasLayout {
                                     ? panePositions(param.thisObject, adapter) : null);
                             CanvasDisplay display = canvasDisplay((View) param.thisObject);
                             layoutDisplay.set(display);
-                            if (panes >= 3 && (display.landscape()
-                                    || CanvasGeometry.hasPhoneRatioColumns(panes, mode))) {
+                            if (panes >= 2 && panes <= 4) {
                                 // 先更新已有任务的比例，再把它们摆进新窗格。
                                 forcePhoneSize(param.thisObject, true);
                             }
@@ -1916,8 +2539,8 @@ final class CanvasLayout {
                         Object adapter = CanvasApi.adapter(param.thisObject);
                         if (adapter == null) return;
                         int panes = count(adapter);
-                        if (panes >= 3) dumpLayout(param.thisObject);
-                        if (panes < 3 || isFourZoomed(param.thisObject)) return;
+                        if (usesCanvasLayout(panes)) dumpLayout(param.thisObject);
+                        if (!usesCanvasLayout(panes) || isFourZoomed(param.thisObject)) return;
                         if (CanvasApi.isColorOs17()) {
                             View canvas = (View) param.thisObject;
                             if (!isZoomAnimating(canvas)) applyOverview(canvas, panes);
@@ -2045,16 +2668,13 @@ final class CanvasLayout {
         return -1;
     }
 
-    private static int canvasScreenOrientation(Activity activity) {
-        if (!CanvasApi.isColorOs17()) return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
-        Object adapter = CanvasApi.adapter(XposedHelpers.callMethod(activity, ACTIVITY_VIEW.value()));
-        int panes = adapter == null ? 0 : count(adapter);
-        return panes == 2 ? ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                : ActivityInfo.SCREEN_ORIENTATION_USER;
+    private static int canvasScreenOrientation() {
+        return CanvasApi.isColorOs17() ? ActivityInfo.SCREEN_ORIENTATION_USER
+                : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
     }
 
     private static void updateCanvasScreenOrientation(Activity activity) {
-        int wanted = canvasScreenOrientation(activity);
+        int wanted = canvasScreenOrientation();
         if (!activity.isFinishing() && activity.getRequestedOrientation() != wanted) {
             activity.setRequestedOrientation(wanted);
         }
@@ -2069,7 +2689,7 @@ final class CanvasLayout {
                                     param.thisObject.getClass().getName())) {
                                 return;
                             }
-                            param.args[0] = canvasScreenOrientation((Activity) param.thisObject);
+                            param.args[0] = canvasScreenOrientation();
                         }
                     });
             if (CanvasApi.isColorOs17()) {
@@ -2078,16 +2698,17 @@ final class CanvasLayout {
                             @Override protected void afterHookedMethod(MethodHookParam param) {
                                 View canvas = (View) XposedHelpers.callMethod(param.thisObject, ACTIVITY_VIEW.value());
                                 Object adapter = CanvasApi.adapter(canvas);
-                                if (adapter == null || count(adapter) < 3) return;
+                                if (adapter == null || count(adapter) < 2) return;
                                 layoutKeys.remove(canvas);
                                 View root = canvas.getRootView();
                                 boolean wasLandscape = root.getWidth() > root.getHeight();
                                 boolean landscape = ((Configuration) param.args[0]).orientation
                                         == Configuration.ORIENTATION_LANDSCAPE;
                                 if (wasLandscape != landscape) {
+                                    cancelPaneEdgeDrag(canvas);
                                     fourZoomed.remove(canvas);
                                     enlargedPanes.remove(canvas);
-                                    pendingMainSwaps.remove(canvas);
+                                    cancelMainPaneAnimation(canvas);
                                     cancelZoom(canvas);
                                     markEnlarged(adapter, count(adapter), -1);
                                 }
@@ -2120,9 +2741,8 @@ final class CanvasLayout {
                                     try {
                                         attempts = 0;
                                         syncTaskData(view);
-                                        // 二窗是系统原生分屏，重排和看门狗都留给系统
                                         Object adapter = CanvasApi.adapter(view);
-                                        if (adapter == null || count(adapter) < 3) return;
+                                        if (adapter == null || !usesCanvasLayout(count(adapter))) return;
                                         forcePhoneSize(view);
                                         if (!CanvasApi.isColorOs17()
                                                 || contentRect(view) == null) {
@@ -2164,7 +2784,7 @@ final class CanvasLayout {
                         Object adapter = CanvasApi.adapter(param.thisObject);
                         if (adapter == null) return;
                         int total = count(adapter);
-                        if (total < 3) return;
+                        if (!usesCanvasLayout(total)) return;
                         if (CanvasApi.isColorOs17()) {
                             if ((mode == 0 || mode == 1) && !focusing.contains(param.thisObject)) {
                                 param.setResult(Boolean.FALSE);
@@ -2221,7 +2841,7 @@ final class CanvasLayout {
                             try {
                                 Object adapter = CanvasApi.adapter(canvas);
                                 int total = adapter == null ? 0 : count(adapter);
-                                if (total < 3 || index < 0 || index >= total) return;
+                                if (!usesCanvasLayout(total) || index < 0 || index >= total) return;
                                 if (CanvasApi.isColorOs17()) {
                                     param.setResult(Boolean.FALSE);
                                     if (duration != 450 || !animate || focusing.contains(canvas)) return;
@@ -2324,22 +2944,39 @@ final class CanvasLayout {
     }
 
     private static java.util.Map<Object, Float> columnShares(View canvas, int count) {
+        if (count == 2) return twoColumnShares;
         if (isLandscape(canvas)) return landscapeColumnShares;
         return count == 4 ? fourColumnShares : threeColumnShares;
     }
 
     private static float columnShare(Object canvas, int count, int mode) {
         View view = (View) canvas;
-        float initial = isLandscape(view) ? CanvasGeometry.LANDSCAPE_LEFT_SHARE
+        float initial = isLandscape(view) && count != 2 ? CanvasGeometry.LANDSCAPE_LEFT_SHARE
                 : CanvasGeometry.defaultLeftShare(count, mode);
         return columnShares(view, count).getOrDefault(canvas, initial);
     }
 
     private static int layoutMode(Object adapter) {
+        if (count(adapter) == 2) return DEFAULT_ORIENTATION;
         return forcedOrientation != 0 ? forcedOrientation : (Integer) XposedHelpers.callMethod(adapter, "n");
     }
 
-    private record CanvasDisplay(Rect area, Rect portraitTask, boolean landscape) {}
+    private record CanvasDisplay(Rect area, Rect portraitTask, boolean landscape,
+                                 int preferredMainPaneMode, int twoPaneSecondaryHeight,
+                                 int twoPaneMainHeight, boolean stacked, float stackedShare,
+                                 PaneInsets[] paneInsets) {
+        int margin() {
+            return landscape ? 0 : marginPx();
+        }
+
+        int availableWidth() {
+            return area.width() - 2 * margin();
+        }
+
+        int availableHeight() {
+            return area.height() - 2 * margin();
+        }
+    }
 
     private static boolean isLandscape(View canvas) {
         return canvas.getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
@@ -2354,41 +2991,122 @@ final class CanvasLayout {
         android.view.WindowMetrics metrics = manager.getCurrentWindowMetrics();
         Rect bounds = metrics.getBounds();
         WindowInsets insets = canvas.getRootWindowInsets();
-        return canvasDisplay(bounds.width(), bounds.height(),
-                insets == null ? metrics.getWindowInsets() : insets);
+        CanvasDisplay display = canvasDisplay(bounds.width(), bounds.height(),
+                insets == null ? metrics.getWindowInsets() : insets,
+                canvas.getContext());
+        Object adapter = CanvasApi.adapter(canvas);
+        int count = adapter == null ? 0 : count(adapter);
+        boolean stacked = count == 2 && display.stacked();
+        PaneEdgeDrag drag = paneEdgeDrags.get(canvas);
+        PaneInsets[] geometry = new PaneInsets[count];
+        var saved = paneInsets.get(canvas);
+        if (stacked) {
+            Context context = canvas.getContext();
+            for (int slot = 0; slot < count; slot++) {
+                boolean top = slot == (display.preferredMainPaneMode() == 6 ? 1 : 0);
+                int width = stackedWindowWidth(context, top);
+                if (drag != null && drag.display.stacked() && !drag.edge.divider()
+                        && drag.display.landscape() == display.landscape() && drag.edge.leftPane() == top) {
+                    width = drag.width;
+                }
+                float inset = (100 - width) / 200f;
+                if (inset > 0f) geometry[slot] = new PaneInsets(inset, 0f, inset, 0f);
+            }
+        } else if (count >= 3 && saved != null && !saved.isEmpty()) {
+            int mode = layoutMode(adapter);
+            for (int index = 0; index < count; index++) {
+                geometry[index] = saved.get(new PaneSlot(count, mode, display.landscape(), stacked, index));
+            }
+        }
+        int main = display.twoPaneMainHeight();
+        int secondary = display.twoPaneSecondaryHeight();
+        if (drag != null && count == 2 && !stacked && !drag.edge.divider()
+                && drag.display.landscape() == display.landscape()) {
+            if (drag.edge.main()) main = drag.height;
+            else secondary = drag.height;
+        }
+        return new CanvasDisplay(display.area(), display.portraitTask(), display.landscape(),
+                display.preferredMainPaneMode(), secondary, main, stacked,
+                stackedShares.getOrDefault(canvas, 1f / 3f), geometry);
     }
 
     private static CanvasDisplay fallbackCanvasDisplay() {
         android.util.DisplayMetrics metrics = android.content.res.Resources.getSystem().getDisplayMetrics();
-        return canvasDisplay(metrics.widthPixels, metrics.heightPixels, null);
+        return canvasDisplay(metrics.widthPixels, metrics.heightPixels, null, null);
     }
 
-    private static CanvasDisplay canvasDisplay(int width, int height, WindowInsets windowInsets) {
+    private static CanvasDisplay canvasDisplay(int width, int height, WindowInsets windowInsets,
+                                               Context context) {
+        boolean landscape = width > height;
+        int mainSide = 0;
+        int secondaryHeight = 0;
+        int mainHeight = 0;
+        boolean stacked = context != null && stackedTwoPanes(context);
+        if (context != null) {
+            var prefs = context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE);
+            mainSide = prefs.getInt(MAIN_WINDOW_SIDE, 0);
+            secondaryHeight = prefs.getInt(twoPaneHeightKey(landscape, false), 0);
+            mainHeight = prefs.getInt(twoPaneHeightKey(landscape, true), 0);
+        }
         Rect portraitTask = new Rect(0, 0, Math.min(width, height),
                 Math.max(width, height) - statusBarHeight());
-        if (width <= height) {
-            return new CanvasDisplay(new Rect(0, statusBarHeight(), width, height), portraitTask, false);
+        if (!landscape) {
+            return new CanvasDisplay(new Rect(0, statusBarHeight(), width, height),
+                    portraitTask, false, mainSide, secondaryHeight, mainHeight, stacked, 1f / 3f, new PaneInsets[0]);
         }
         // 横屏画布可进入挖孔区域，系统栏仍按实际占用空间计算。
         Insets insets = windowInsets == null ? Insets.NONE : windowInsets.getInsets(
                 WindowInsets.Type.navigationBars() | WindowInsets.Type.statusBars());
         Rect area = new Rect(insets.left, insets.top, width - insets.right, height - insets.bottom);
-        return new CanvasDisplay(area, portraitTask, true);
+        return new CanvasDisplay(area, portraitTask, true, mainSide, secondaryHeight, mainHeight, stacked, 1f / 3f, new PaneInsets[0]);
     }
 
-    private static java.util.List<Rect> proportionalPanes(int count, int mode, float leftShare,
-                                                         CanvasDisplay display) {
-        int outerMargin = display.landscape() ? 0 : 2 * marginPx();
-        int width = display.area().width() - outerMargin;
-        int height = display.area().height() - outerMargin;
-        if (display.landscape()) {
-            return CanvasGeometry.landscapeRow(width, height, columnGap(), count, leftShare);
+    private static int twoPaneHeightPercent(CanvasDisplay display, boolean main) {
+        int saved = main ? display.twoPaneMainHeight() : display.twoPaneSecondaryHeight();
+        if (saved > 0) return saved;
+        if (display.landscape()) return 100;
+        float baselineShare = CanvasGeometry.defaultLeftShare(2, DEFAULT_ORIENTATION);
+        float width = (display.availableWidth() - columnGap()) * (main ? 1f - baselineShare : baselineShare);
+        Rect phone = display.portraitTask();
+        int percent = Math.round(100f * width * phone.height() / phone.width() / display.availableHeight());
+        return Math.max(MIN_TWO_PANE_HEIGHT, Math.min(100, percent));
+    }
+
+    private static List<Rect> proportionalPanes(int count, int mode, float leftShare, CanvasDisplay display) {
+        List<Rect> panes = basePanes(count, mode, leftShare, display);
+        for (int index = 0; index < Math.min(panes.size(), display.paneInsets().length); index++) {
+            PaneInsets insets = display.paneInsets()[index];
+            if (insets != null) panes.set(index, insets.apply(panes.get(index)));
         }
-        if (CanvasGeometry.hasPhoneRatioColumns(count, mode)) {
-            return CanvasGeometry.phoneRatioColumns(width, height, columnGap(), count, mode,
+        return panes;
+    }
+
+    private static List<Rect> basePanes(int count, int mode, float leftShare, CanvasDisplay display) {
+        int width = count == 2 ? display.area().width() : display.availableWidth();
+        int height = display.availableHeight();
+        List<Rect> panes;
+        if (count == 2 && display.stacked()) {
+            return CanvasGeometry.twoStackedPanes(width, height, columnGap(), display.stackedShare(),
+                    display.preferredMainPaneMode() == 6);
+        }
+        if (count == 2) {
+            int secondaryHeight = Math.round(height * twoPaneHeightPercent(display, false) / 100f);
+            int mainHeight = Math.round(height * twoPaneHeightPercent(display, true) / 100f);
+            panes = CanvasGeometry.twoPanes(width, height, columnGap(), leftShare,
+                    secondaryHeight, mainHeight);
+        } else if (display.landscape()) {
+            panes = CanvasGeometry.landscapeRow(width, height, columnGap(), count, leftShare);
+        } else if (CanvasGeometry.hasPhoneRatioColumns(count, mode)) {
+            panes = CanvasGeometry.phoneRatioColumns(width, height, columnGap(), count, mode,
                     leftShare, display.portraitTask());
+        } else {
+            panes = CanvasGeometry.panes(width, height, columnGap(), count, mode, leftShare);
         }
-        return CanvasGeometry.panes(width, height, columnGap(), count, mode, leftShare);
+        int mainMode = display.landscape() ? DEFAULT_ORIENTATION : mode;
+        if (panes.size() == count && isMainPaneReversed(count, mainMode, display.preferredMainPaneMode())) {
+            CanvasGeometry.moveMainPaneToOppositeSide(panes, CanvasGeometry.mainPane(count, mainMode));
+        }
+        return panes;
     }
 
     private static java.util.List<Rect> fourPanes() {
@@ -2407,34 +3125,61 @@ final class CanvasLayout {
 
         CanvasDisplay display = canvasDisplay((View) canvas);
         Rect target = display.portraitTask();
-
         int mode = layoutMode(adapter);
-        if (!display.landscape() && CanvasGeometry.hasPhoneRatioColumns(count, mode)) {
-            return java.util.Collections.nCopies(count, target);
+        if (count == 2) {
+            List<Rect> panes = proportionalPanes(count, mode, columnShare(canvas, count, mode), display);
+            if (panes.size() != count) return List.of(target, target);
+            float baseTaskScale = display.landscape() ? 1f : 1.5f;
+            List<Rect> targets = new ArrayList<>(count);
+            float referenceWidth = display.stacked() ? display.area().width()
+                    : (display.area().width() - columnGap()) / 2f;
+            int availableHeight = display.availableHeight();
+            for (int slot = 0; slot < count; slot++) {
+                float referenceHeight;
+                if (display.stacked()) {
+                    referenceHeight = (availableHeight - columnGap()) * (slot == 0 ? 1f / 3f : 2f / 3f);
+                } else {
+                    referenceHeight = display.landscape() ? availableHeight
+                            : Math.min(availableHeight, referenceWidth * target.height() / target.width());
+                }
+                targets.add(responsiveTaskBounds(panes.get(slot), baseTaskScale, referenceWidth, referenceHeight));
+            }
+            return inTaskOrder(targets, panePositions(canvas, adapter));
         }
-        java.util.List<Rect> panes = proportionalPanes(count, mode, columnShare(canvas, count, mode), display);
+        float initialShare = display.landscape() ? CanvasGeometry.LANDSCAPE_LEFT_SHARE
+                : CanvasGeometry.defaultLeftShare(count, mode);
+        List<Rect> baseline = basePanes(count, mode, initialShare, display);
+        if (baseline.size() != count) return java.util.Collections.nCopies(count, target);
+        List<Rect> panes = proportionalPanes(count, mode, columnShare(canvas, count, mode), display);
         if (panes.size() != count) return java.util.Collections.nCopies(count, target);
-        int landscapeMain = -1;
-        if (display.landscape() && count == 3) {
-            panes = inTaskOrder(panes, panePositions(canvas, adapter));
-            landscapeMain = mainPane(canvas, adapter);
-        }
+        int mainSlot = CanvasGeometry.mainPane(count, mainPaneMode((View) canvas, adapter));
         int minWidth = Math.round(240f * android.content.res.Resources
                 .getSystem().getDisplayMetrics().density);
         if (display.landscape()) minWidth = target.width();
         java.util.ArrayList<Rect> targets = new java.util.ArrayList<>(count);
         for (int index = 0; index < count; index++) {
             Rect pane = panes.get(index);
-            if (index == landscapeMain) {
-                // 扩大应用的逻辑画布，再等比缩回主窗，给内容留出更多空间。
-                float scale = Math.min(1.6f, (float) display.area().width() / pane.width());
-                targets.add(new Rect(0, 0, Math.round(pane.width() * scale),
-                        Math.round(pane.height() * scale)));
+            Rect original = baseline.get(index);
+            float taskScale;
+            if (display.landscape() && index == mainSlot) {
+                taskScale = Math.min(1.6f, (float) display.area().width() / original.width());
             } else {
-                targets.add(CanvasGeometry.taskBounds(pane, target, minWidth));
+                Rect originalTarget = !display.landscape() && CanvasGeometry.hasPhoneRatioColumns(count, mode)
+                        ? target : CanvasGeometry.taskBounds(original, target, minWidth);
+                taskScale = Math.max((float) originalTarget.width() / original.width(),
+                        (float) originalTarget.height() / original.height());
             }
+            targets.add(responsiveTaskBounds(pane, taskScale, original.width(), original.height()));
         }
-        return targets;
+        return inTaskOrder(targets, mainSlot >= 0 ? panePositions(canvas, adapter) : null);
+    }
+
+    private static Rect responsiveTaskBounds(Rect pane, float taskScale, float referenceWidth,
+                                              float referenceHeight) {
+        double areaRatio = (pane.width() / referenceWidth) * (pane.height() / referenceHeight);
+        taskScale /= (float) Math.min(1d, Math.pow(areaRatio, 0.6));
+        return new Rect(0, 0, Math.max(1, Math.round(pane.width() * taskScale)),
+                Math.max(1, Math.round(pane.height() * taskScale)));
     }
 
     private static List<Rect> inTaskOrder(List<Rect> panes, int[] order) {
@@ -2462,23 +3207,18 @@ final class CanvasLayout {
             containers.put(container, Boolean.TRUE);
             int count = count(adapter);
             Integer last = taskCounts.put(container, count);
-            if (CanvasApi.isColorOs17() && (last == null || (last == 2) != (count == 2))) {
-                View canvas = (View) container;
-                Object activity = XposedHelpers.callMethod(canvas, "Z2", canvas.getContext());
-                if (activity instanceof Activity host) {
-                    canvas.post(() -> updateCanvasScreenOrientation(host));
-                }
-            }
-            boolean justLeftThree = last != null && last >= 3 && count < 3;
+            boolean restoreSystemSplit = !CanvasApi.isColorOs17() && last != null
+                    && last >= 3 && count == 2;
             if (last != null && last != count) {
                 layoutKeys.remove(container);
                 if (CanvasApi.isColorOs17()) {
+                    cancelPaneEdgeDrag((View) container);
                     fourZoomed.remove(container);
                     enlargedPanes.remove(container);
-                    pendingMainSwaps.remove(container);
+                    cancelMainPaneAnimation(container);
                     tasksBySlot.remove(container);
                     cancelZoom(container);
-                    if (count >= 3) markEnlarged(adapter, count, -1);
+                    if (count >= 2) markEnlarged(adapter, count, -1);
                     else menuShrunk.remove(container);
                 }
                 // 四窗总览是 2×2 的缩放值，关掉一个窗口后画布还停在这个比例上，
@@ -2491,9 +3231,8 @@ final class CanvasLayout {
             }
             windowCount = count;
             multiWindowMode = count == 3;
-            if (count < 3) {
-                // 只在从三窗退下来的那一次恢复，之后交给系统
-                if (justLeftThree) restoreTwoSplit(container, adapter, count);
+            if (!usesCanvasLayout(count)) {
+                if (restoreSystemSplit) restoreTwoSplit(container, adapter, count);
                 return;
             }
             java.util.List<Rect> targets = taskTargets(container, adapter, count);
@@ -2571,11 +3310,9 @@ final class CanvasLayout {
             int count = count(adapter);
             windowCount = count;
             multiWindowMode = count == 3;
-            if (count < 3) return;
+            if (!usesCanvasLayout(count)) return;
 
-            fixedPaneSizes = CanvasApi.isColorOs17()
-                    && (isLandscape((View) container)
-                            || CanvasGeometry.hasPhoneRatioColumns(count, layoutMode(adapter)));
+            fixedPaneSizes = CanvasApi.isColorOs17() && count >= 2 && count <= 4;
             java.util.List<Rect> targets = taskTargets(container, adapter, count);
             ClassLoader loader = container.getClass().getClassLoader();
 
@@ -2822,6 +3559,15 @@ final class CanvasLayout {
     }
 
     // ---------------------------------------------------------------- 工具
+
+    private static boolean usesCanvasLayout(int count) {
+        return count >= (CanvasApi.isColorOs17() ? 2 : 3);
+    }
+
+    private static void cancelPaneEdgeDrag(View canvas) {
+        PaneEdgeDrag drag = paneEdgeDrags.remove(canvas);
+        if (drag != null) restorePaneSize(canvas, drag);
+    }
 
     private static int count(Object adapter) {
         try {
