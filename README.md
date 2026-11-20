@@ -14,6 +14,14 @@
 - **入口**：可通过智能侧边栏向当前画布添加应用，也可以用下方 ADB 命令打开多窗。
 - **真机验证**：一加 15（PLK110），ColorOS 17.0.0.105，系统画布 2.0.0。不同系统或画布版本的兼容性可能不同。
 
+## 真机演示
+
+一加 15 录屏，依次展示竖屏三窗、竖屏四窗、横屏四窗和横屏三窗。
+
+[下载演示视频（MP4，约 16 秒）](https://github.com/vialoyed-ctrl/OnePlusSplitScreenEnhancer/releases/download/v0.2.13/OnePlusSplitScreenEnhancer-demo.mp4)
+
+![一加分屏增强的横屏四窗和横屏三窗对比](docs/demo-preview.jpg)
+
 ## 下载与安装
 
 1. 从 [GitHub Releases](https://github.com/vialoyed-ctrl/OnePlusSplitScreenEnhancer/releases/latest) 下载 APK 并安装。
