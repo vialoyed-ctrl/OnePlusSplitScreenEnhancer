@@ -16,6 +16,15 @@ final class Settings {
     static final String ACTION_CHANGED = "com.canvasplus.SETTINGS_CHANGED";
 
     static final String PREFS = "canvasplus";
+    static final String DIAGNOSTICS_ENABLED = "diagnostics_enabled";
+
+    static boolean diagnosticsEnabled(Context context) {
+        return prefs(context).getBoolean(DIAGNOSTICS_ENABLED, false);
+    }
+
+    static boolean setDiagnosticsEnabled(Context context, boolean enabled) {
+        return prefs(context).edit().putBoolean(DIAGNOSTICS_ENABLED, enabled).commit();
+    }
     /** 从菜单缩小过之后，点击小窗口不再自动放大。 */
     static final String NO_CLICK_ZOOM = "no_click_zoom";
     private static final boolean NO_CLICK_ZOOM_DEFAULT = true;
@@ -81,7 +90,7 @@ final class Settings {
         ModuleEntry.log("click zoom preference updated: " + preventClickZoom);
     }
 
-    private static Bundle shareIdentity() {
+    static Bundle shareIdentity() {
         return BroadcastOptions.makeBasic().setShareIdentityEnabled(true)
                 .setDeferralPolicy(BroadcastOptions.DEFERRAL_POLICY_NONE).toBundle();
     }

@@ -1,8 +1,14 @@
 // 一加分屏增强修改了 CanvasPlus 的此源文件。
 package com.canvasplus;
 
+import android.app.Application;
+import android.content.Context;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XSharedPreferences;
 import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
@@ -27,6 +33,15 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam param) {
         if (param == null || param.packageName == null) return;
         if (halted()) return;
+        if (DiagnosticLog.accepts(param.packageName)) {
+            try {
+                var prefs = new XSharedPreferences("com.canvasplus", Settings.PREFS);
+                DiagnosticLog.setEnabled(prefs.getBoolean(Settings.DIAGNOSTICS_ENABLED, false));
+            } catch (RuntimeException unavailable) {
+                XposedBridge.log("CanvasPlus: diagnostic preference unavailable: " + unavailable);
+            }
+            attachDiagnostics(param.packageName);
+        }
 
         switch (param.packageName) {
             case "com.oplus.pscanvas":
@@ -49,6 +64,24 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
         }
     }
 
+    private static void attachDiagnostics(String packageName) {
+        try {
+            XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            Context context = (Context) param.args[0];
+                            try {
+                                if (packageName.equals(context.getPackageName())) DiagnosticLog.start(context);
+                            } catch (RuntimeException error) {
+                                XposedBridge.log("CanvasPlus: diagnostic initialization failed: " + error);
+                            }
+                        }
+                    });
+        } catch (RuntimeException | LinkageError error) {
+            XposedBridge.log("CanvasPlus: diagnostic hook unavailable: " + error);
+        }
+    }
+
     private static boolean halted() {
         try {
             return new java.io.File(HALT_MARKER).exists();
@@ -59,5 +92,6 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
 
     static void log(String message) {
         XposedBridge.log("CanvasPlus: " + message);
+        DiagnosticLog.record(message);
     }
 }

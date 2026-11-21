@@ -2,8 +2,8 @@
 <!-- 一加分屏增强修改了 CanvasPlus 的应用清单。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.canvasplus"
-    android:versionCode="33"
-    android:versionName="0.2.31">
+    android:versionCode="45"
+    android:versionName="0.2.43">
 
     <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="36" />
 
@@ -29,6 +29,10 @@
                 <action android:name="com.canvasplus.READ_SETTINGS" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".DiagnosticLogReceiver"
+            android:exported="true" />
 
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription"

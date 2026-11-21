@@ -67,8 +67,17 @@ final class CanvasGeometry {
         return Math.round(available * 2f / 3f);
     }
 
+    static List<Rect> threeStackedPanes(int width, int height, int gap, float topShare, float leftShare) {
+        List<Rect> rows = twoStackedPanes(width, height, gap, topShare, false);
+        if (rows.size() != 2 || width <= gap + 2) return Collections.emptyList();
+        List<Rect> panes = new ArrayList<>(3);
+        addColumns(panes, rows.get(0), Math.round((width - gap) * leftShare), gap);
+        panes.add(rows.get(1));
+        return panes;
+    }
+
     static float defaultLeftShare(int count, int mode) {
-        if (count == 4) return 0.5f;
+        if (count == 4 || (count == 3 && mode == 5)) return 0.5f;
         return mode == 7 ? 1f / 3f : 2f / 3f;
     }
 
@@ -105,6 +114,7 @@ final class CanvasGeometry {
 
     static int mainPane(int count, int mode) {
         if (count != 2 && count != 3) return -1;
+        if (count == 3 && mode == 5) return 2;
         if (mode == 6) return 0;
         return mode == 7 ? count - 1 : -1;
     }
@@ -134,6 +144,11 @@ final class CanvasGeometry {
     }
 
     static List<Rect> landscapeRow(int width, int height, int gap, int count, float leftShare) {
+        return landscapeRow(width, height, gap, count, leftShare, null);
+    }
+
+    static List<Rect> landscapeRow(int width, int height, int gap, int count, float leftShare,
+                                   float[] dividers) {
         List<Rect> panes = new ArrayList<>(count);
         int space = width - gap * (count - 1);
         if ((count != 3 && count != 4) || space < count * 10 || height <= 0) return panes;
@@ -147,10 +162,12 @@ final class CanvasGeometry {
             panes.add(new Rect(leftWidth + 2 * gap, 0, width, height));
             return panes;
         }
+        int previous = 0;
         for (int index = 0; index < count; index++) {
-            int left = space * index / count + gap * index;
-            int right = space * (index + 1) / count + gap * index;
-            panes.add(new Rect(left, 0, right, height));
+            int cut = index == count - 1 ? space : dividers == null
+                    ? space * (index + 1) / count : (int) (space * dividers[index]);
+            panes.add(new Rect(previous + gap * index, 0, cut + gap * index, height));
+            previous = cut;
         }
         return panes;
     }
@@ -167,6 +184,7 @@ final class CanvasGeometry {
         int maxRightWidth = (int) (((height - (rightRows - 1) * gap) / rightRows) / aspect);
         int columnsWidth = Math.min(width - gap, (int) Math.min(
                 maxLeftWidth / leftShare, maxRightWidth / (1f - leftShare)));
+        if (count == 4) columnsWidth -= columnsWidth % 2;
         int leftWidth = Math.round(columnsWidth * leftShare);
         int rightWidth = columnsWidth - leftWidth;
         if (leftWidth <= 0 || rightWidth <= 0) return panes;
@@ -192,6 +210,12 @@ final class CanvasGeometry {
             panes.add(below(rightFirst, gap));
         }
         return panes;
+    }
+
+    static float clampFourDivider(float share, float[] dividers, int index) {
+        float lower = index == 0 ? 0f : dividers[index - 1];
+        float upper = index == dividers.length - 1 ? 1f : dividers[index + 1];
+        return Math.max(lower + 0.10f, Math.min(upper - 0.10f, share));
     }
 
     private static Rect below(Rect pane, int gap) {

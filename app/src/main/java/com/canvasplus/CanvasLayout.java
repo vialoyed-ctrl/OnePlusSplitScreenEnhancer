@@ -40,11 +40,10 @@ import de.robv.android.xposed.XposedHelpers;
  */
 final class CanvasLayout {
 
-    private static final String TAG = "CanvasPlus";
     private static final String FLEXIBLE_TASK_VIEW =
             "com.oplus.flexiblewindow.FlexibleTaskView";
     private static final String PROPORTIONAL_BOUNDS = "canvasplus.proportionalBounds";
-    private static final int DIVIDER_BLUE = 0xffa8d7ff;
+    private static final int DIVIDER_BLUE = 0xff9bd3ff;
     static volatile int forcedMode = 0;
     static final int DEFAULT_ORIENTATION = 7;
     /** 7 表示左边两个小窗、右边一个主窗，0 表示交给系统。 */
@@ -352,7 +351,8 @@ final class CanvasLayout {
             Rect area = canvasArea(canvas);
             boolean landscape = isLandscape(canvas);
             int margin = landscape ? 0 : marginPx();
-            boolean alignTop = !landscape && !enlarge && panes == 4;
+            boolean alignTop = !landscape && !enlarge && (panes == 4
+                    || (panes == 3 && layoutMode(adapter) == THREE_STACKED_MODE));
             float top = area.top + (alignTop ? 0 : margin);
             float height = area.bottom - top - margin;
             float scale = Math.min((float) area.width() / bounds.width(), height / bounds.height());
@@ -398,15 +398,18 @@ final class CanvasLayout {
     private static final int MAIN_WINDOW_ACTION = 1025;
     private static final int AUTO_MAIN_WINDOW_ACTION = 1026;
     private static final int MOVE_MAIN_WINDOW_ACTION = 1027;
-    private static final int TWO_PANE_LAYOUT_ACTION = 1028;
-    private static final int STACKED_WINDOW_WIDTH_ACTION = 1029;
+    private static final int THREE_PANE_LAYOUT_ACTION = 1028;
+    private static final int TWO_PANE_LAYOUT_ACTION = 1029;
     private static final int LAYOUT_LOCK_ACTION = 1030;
+    private static final int STACKED_WINDOW_WIDTH_ACTION = 1031;
     private static final String LAYOUT_LOCKED = "layout_locked";
     private static final String AUTO_MAIN_WINDOW = "auto_main_window";
     private static final String MAIN_WINDOW_SIDE = "main_window_side";
-    private static final String STACKED_TWO_PANES = "stacked_two_panes";
+    private static final int THREE_STACKED_MODE = 5;
+    private static final String THREE_STACKED = "three_panes_stacked";
+    private static boolean restoredThreePaneMode;
     private static final float DEFAULT_STACKED_SHARE = 1f / 3f;
-    private static final int MIN_STACKED_WIDTH = 30;
+    private static final String TWO_STACKED = "two_panes_stacked";
     private static final int MIN_TWO_PANE_HEIGHT = 25;
     private static final java.util.WeakHashMap<View, PaneEdgeDrag> paneEdgeDrags =
             new java.util.WeakHashMap<>();
@@ -423,11 +426,7 @@ final class CanvasLayout {
         Context context = canvas.getContext();
         boolean locked = !layoutLocked(context);
         layoutPrefs(context).edit().putBoolean(LAYOUT_LOCKED, locked).apply();
-        if (locked) {
-            cancelPaneEdgeDrag(canvas);
-            for (ColumnDrag drag : columnDrags.values()) drag.clearPreview();
-            columnDrags.clear();
-        }
+        if (locked) cancelPaneEdgeDrag(canvas);
         requestPaneLayout(canvas);
         log("layout locked=" + locked);
     }
@@ -438,8 +437,8 @@ final class CanvasLayout {
     }
 
     private static int preferredMainPaneMode(Context context) {
-        return context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
-                .getInt(MAIN_WINDOW_SIDE, 0);
+        var prefs = layoutPrefs(context);
+        return prefs.getInt(orientedKey(MAIN_WINDOW_SIDE, context), prefs.getInt(MAIN_WINDOW_SIDE, 0));
     }
 
     private static int mainPaneModeOnScreen(View canvas, Object adapter) {
@@ -448,7 +447,7 @@ final class CanvasLayout {
     }
 
     private static boolean isMainPaneReversed(int count, int layoutMode, int preferredMode) {
-        return preferredMode != 0 && preferredMode != layoutMode
+        return layoutMode != THREE_STACKED_MODE && preferredMode != 0 && preferredMode != layoutMode
                 && CanvasGeometry.mainPane(count, layoutMode) >= 0;
     }
 
@@ -464,7 +463,7 @@ final class CanvasLayout {
         }
         int target = mainPaneModeOnScreen(canvas, adapter) == 6 ? 7 : 6;
         canvas.getContext().getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit()
-                .putInt(MAIN_WINDOW_SIDE, target).apply();
+                .putInt(orientedKey(MAIN_WINDOW_SIDE, canvas.getContext()), target).apply();
         cancelZoom(canvas);
         enlargedPanes.remove(canvas);
         fourZoomed.remove(canvas);
@@ -480,17 +479,22 @@ final class CanvasLayout {
                 + (main ? "main" : "secondary");
     }
 
-    private static boolean stackedTwoPanes(Context context) {
-        return context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE)
-                .getBoolean(STACKED_TWO_PANES, false);
+    static int savedThreePaneMode(Context context) {
+        return layoutPrefs(context).getBoolean(THREE_STACKED, false) ? THREE_STACKED_MODE : DEFAULT_ORIENTATION;
     }
 
-    private static void toggleTwoPaneLayout(View canvas, Object adapter) {
-        Context context = canvas.getContext();
-        context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE).edit()
-                .putBoolean(STACKED_TWO_PANES, !stackedTwoPanes(context)).apply();
-        refreshTwoPaneOverview(canvas, adapter);
-        log("two pane stacked=" + stackedTwoPanes(context));
+    private static void toggleThreePaneLayout(View canvas, Object adapter) {
+        boolean stacked = layoutMode(adapter) != THREE_STACKED_MODE;
+        layoutPrefs(canvas.getContext()).edit().putBoolean(THREE_STACKED, stacked).apply();
+        forcedOrientation = stacked ? THREE_STACKED_MODE : DEFAULT_ORIENTATION;
+        cancelPaneEdgeDrag(canvas);
+        cancelMainPaneAnimation(canvas);
+        cancelZoom(canvas);
+        enlargedPanes.remove(canvas);
+        fourZoomed.remove(canvas);
+        markEnlarged(adapter, 3, -1);
+        tasksBySlot.remove(canvas);
+        requestPaneLayout(canvas);
     }
 
     private static void refreshTwoPaneOverview(View canvas, Object adapter) {
@@ -503,25 +507,35 @@ final class CanvasLayout {
         requestPaneLayout(canvas);
     }
 
-    private static String legacyStackedWidthKey(boolean top) {
-        return top ? "stacked_width_top" : "stacked_width_bottom";
+    private static String orientedKey(String key, Context context) {
+        boolean landscape = context.getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_LANDSCAPE;
+        return key + (landscape ? "_landscape" : "_portrait");
     }
 
-    private static String stackedWidthKey(View canvas, boolean top) {
-        return paneLayoutKey(2, DEFAULT_ORIENTATION, isLandscape(canvas), true)
+    private static boolean twoPanesStacked(Context context) {
+        var prefs = layoutPrefs(context);
+        return prefs.getBoolean(orientedKey(TWO_STACKED, context), prefs.getBoolean(TWO_STACKED, true));
+    }
+
+    private static void toggleTwoPaneLayout(View canvas, Object adapter) {
+        Context context = canvas.getContext();
+        layoutPrefs(context).edit().putBoolean(orientedKey(TWO_STACKED, context), !twoPanesStacked(context)).apply();
+        tasksBySlot.remove(canvas);
+        refreshTwoPaneOverview(canvas, adapter);
+    }
+
+    private static String stackedWidthKey(boolean landscape, boolean top) {
+        return paneLayoutKey(2, DEFAULT_ORIENTATION, landscape, true)
                 + (top ? "_top_width" : "_bottom_width");
     }
 
-    private static int stackedWindowWidth(View canvas, boolean top, boolean narrow) {
-        var prefs = layoutPrefs(canvas.getContext());
+    private static int stackedWindowWidth(Context context, boolean landscape, boolean top, boolean narrow) {
+        var prefs = layoutPrefs(context);
         String suffix = narrow ? "_narrow" : "";
-        int legacyWidth = prefs.getInt(legacyStackedWidthKey(top) + suffix, narrow ? 50 : 100);
-        return prefs.getInt(stackedWidthKey(canvas, top) + suffix, legacyWidth);
-    }
-
-    private static void saveStackedWindowWidth(SharedPreferences.Editor editor, String key, int width) {
-        editor.putInt(key, width);
-        if (width < 100) editor.putInt(key + "_narrow", width);
+        String legacy = top ? "stacked_width_top" : "stacked_width_bottom";
+        return prefs.getInt(stackedWidthKey(landscape, top) + suffix,
+                prefs.getInt(legacy + suffix, narrow ? 50 : 100));
     }
 
     private static boolean isTopStackedWindow(View canvas, Object adapter, int index) {
@@ -531,109 +545,143 @@ final class CanvasLayout {
     }
 
     private static void toggleStackedWindowWidth(View canvas, Object adapter, int index) {
-        if (layoutLocked(canvas.getContext())) return;
+        Context context = canvas.getContext();
+        if (layoutLocked(context) || !twoPanesStacked(context)) return;
         boolean top = isTopStackedWindow(canvas, adapter, index);
-        int width = stackedWindowWidth(canvas, top, false) < 100 ? 100
-                : stackedWindowWidth(canvas, top, true);
-        var editor = layoutPrefs(canvas.getContext()).edit();
-        saveStackedWindowWidth(editor, stackedWidthKey(canvas, top), width);
-        editor.apply();
+        boolean landscape = isLandscape(canvas);
+        int width = stackedWindowWidth(context, landscape, top, false) < 100 ? 100
+                : stackedWindowWidth(context, landscape, top, true);
+        layoutPrefs(context).edit().putInt(stackedWidthKey(landscape, top), width).apply();
         refreshTwoPaneOverview(canvas, adapter);
     }
 
     private static String paneLayoutKey(int count, int mode, boolean landscape, boolean stacked) {
         // 横屏三、四窗以及竖屏四窗的几何布局不依赖系统传入的三窗方向。
-        int layoutMode = landscape || count == 4 ? 0 : mode;
+        int layoutMode = count == 4 || landscape ? 0 : mode;
         return "pane_size_" + count + "_" + layoutMode
                 + (landscape ? "_landscape" : "_portrait") + (stacked ? "_stacked" : "");
     }
 
-    private record PaneInsets(float left, float top, float right, float bottom) {
-        static final PaneInsets NONE = new PaneInsets(0, 0, 0, 0);
+    private static final int PRIMARY_DIVIDER = -1;
+    private static final int UPPER_COLUMNS_DIVIDER = -2;
+    private static final int MAIN_BOTTOM_EDGE = -3;
+    private static final int SECONDARY_BOTTOM_EDGE = -4;
+    private static final android.graphics.Paint DIVIDER_PAINT =
+            new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
 
-        Rect apply(Rect slot) {
-            return new Rect(slot.left + Math.round(left * slot.width()),
-                    slot.top + Math.round(top * slot.height()),
-                    slot.right - Math.round(right * slot.width()),
-                    slot.bottom - Math.round(bottom * slot.height()));
-        }
-
-        PaneInsets move(int horizontal, int vertical, float dx, float dy) {
-            return new PaneInsets(horizontal < 0 ? clamp(left + dx, right) : left,
-                    vertical < 0 ? clamp(top + dy, bottom) : top,
-                    horizontal > 0 ? clamp(right - dx, left) : right,
-                    vertical > 0 ? clamp(bottom - dy, top) : bottom);
-        }
-
-        private static float clamp(float value, float opposite) {
-            return Math.max(0f, Math.min(0.60f - opposite, value));
+    private record PaneEdge(Rect hit, int index, boolean horizontal) {
+        boolean bottomEdge() {
+            return index == MAIN_BOTTOM_EDGE || index == SECONDARY_BOTTOM_EDGE;
         }
     }
 
-    private static PaneInsets readPaneInsets(SharedPreferences prefs, String layoutKey, int index) {
-        String key = layoutKey + "_pane_" + index;
-        return new PaneInsets(prefs.getFloat(key + "_left", 0f), prefs.getFloat(key + "_top", 0f),
-                prefs.getFloat(key + "_right", 0f), prefs.getFloat(key + "_bottom", 0f));
+    private static Rect paneFrame(View canvas, int index) {
+        View pane = (View) XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), index);
+        if (pane == null || !pane.isShown()) return null;
+        Object taskView = XposedHelpers.callMethod(pane, "getFlexibleTaskView");
+        if (taskView == null) return null;
+        Rect bounds = (Rect) XposedHelpers.callMethod(taskView, "calculateFrame");
+        return bounds.isEmpty() ? null : bounds;
     }
-
-    private static void savePaneInsets(SharedPreferences.Editor editor, String layoutKey, int index,
-                                       PaneInsets insets) {
-        String key = layoutKey + "_pane_" + index;
-        editor.putFloat(key + "_left", insets.left())
-                .putFloat(key + "_top", insets.top())
-                .putFloat(key + "_right", insets.right())
-                .putFloat(key + "_bottom", insets.bottom());
-    }
-
-    private record PaneEdge(Rect hit, int index, boolean main, boolean leftPane, int horizontal,
-                            int vertical, boolean divider) {}
 
     private static List<PaneEdge> resizeEdges(View canvas) {
         if (layoutLocked(canvas.getContext())) return List.of();
         Object adapter = CanvasApi.adapter(canvas);
         int count = adapter == null ? 0 : count(adapter);
-        if (count < 2 || count > 4 || isFourZoomed(canvas)
+        if (count < 2 || count > 4 || (count == 4 && !isLandscape(canvas)) || isFourZoomed(canvas)
                 || isZoomAnimating(canvas) || mainPaneAnimations.containsKey(canvas)) return List.of();
         WindowInsets insets = canvas.getRootWindowInsets();
         if (insets != null && insets.isVisible(WindowInsets.Type.ime())) return List.of();
-        int main = mainPane(canvas, adapter);
+        boolean threeStacked = count == 3 && layoutMode(adapter) == THREE_STACKED_MODE;
         Rect[] panes = new Rect[count];
         for (int index = 0; index < panes.length; index++) {
-            View pane = (View) XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), index);
-            if (pane == null || !pane.isShown()) return List.of();
-            Object taskView = XposedHelpers.callMethod(pane, "getFlexibleTaskView");
-            if (taskView == null) return List.of();
-            Rect bounds = (Rect) XposedHelpers.callMethod(taskView, "calculateFrame");
-            if (bounds.isEmpty()) return List.of();
-            panes[index] = bounds;
+            panes[index] = paneFrame(canvas, index);
+            if (panes[index] == null) return List.of();
         }
-        boolean stacked = count == 2 && stackedTwoPanes(canvas.getContext());
         float density = canvas.getResources().getDisplayMetrics().density;
-        int radius = Math.round(7 * density);
-        List<PaneEdge> edges = new ArrayList<>(8 * count + 1);
-        if (count == 2) addTwoPaneDivider(edges, panes, stacked, radius, density);
-        for (int index = 0; index < panes.length; index++) {
-            Rect pane = panes[index];
-            boolean first = count == 2 && (stacked ? pane.top < panes[1 - index].top
-                    : pane.left < panes[1 - index].left);
-            boolean isMain = index == main;
-            for (int horizontal : new int[]{-1, 1}) {
-                int hitLeft = horizontal < 0 ? pane.left : pane.right - radius;
-                int hitRight = hitLeft + radius;
-                for (int vertical : new int[]{-1, 1}) {
-                    int y = vertical < 0 ? pane.top : pane.bottom - 1;
-                    edges.add(new PaneEdge(new Rect(hitLeft, y - radius, hitRight, y + radius),
-                            index, isMain, first, horizontal, vertical, false));
+        int radius = Math.round(8 * density);
+        List<PaneEdge> edges = new ArrayList<>(3);
+        if (count == 2) {
+            boolean stacked = twoPanesStacked(canvas.getContext());
+            addTwoPaneDivider(edges, panes, stacked, radius, density);
+            if (!stacked && !isLandscape(canvas)) {
+                int main = mainPane(canvas, adapter);
+                for (int index = 0; index < panes.length; index++) {
+                    Rect pane = panes[index];
+                    int corner = Math.min(radius, pane.width() / 4);
+                    Rect hit = new Rect(pane.left + corner, pane.bottom - radius / 2,
+                            pane.right - corner, pane.bottom + radius);
+                    edges.add(new PaneEdge(hit, index == main ? MAIN_BOTTOM_EDGE : SECONDARY_BOTTOM_EDGE, true));
                 }
-                edges.add(new PaneEdge(new Rect(hitLeft, pane.top + radius,
-                        hitRight, pane.bottom - radius), index, isMain, first, horizontal, 0, false));
             }
-            edges.add(new PaneEdge(new Rect(pane.left + radius, pane.top - radius,
-                    pane.right - radius, pane.top + radius), index, isMain, first, 0, -1, false));
-            edges.add(new PaneEdge(new Rect(pane.left + radius, pane.bottom - radius,
-                    pane.right - radius, pane.bottom + radius), index, isMain, first, 0, 1, false));
+        }
+        if (threeStacked) {
+            int main = mainPane(canvas, adapter);
+            if (main < 0) return List.of();
+            Rect[] upper = new Rect[2];
+            for (int index = 0, next = 0; index < panes.length; index++) {
+                if (index != main) upper[next++] = panes[index];
+            }
+            Rect topRow = new Rect(upper[0]);
+            topRow.union(upper[1]);
+            addPaneDivider(edges, topRow, panes[main], true, radius, density, PRIMARY_DIVIDER);
+            if (upper[0].left > upper[1].left) {
+                Rect left = upper[1];
+                upper[1] = upper[0];
+                upper[0] = left;
+            }
+            addPaneDivider(edges, upper[0], upper[1], false, radius, density, UPPER_COLUMNS_DIVIDER);
+        }
+        if (count == 3 && !threeStacked) {
+            int main = mainPane(canvas, adapter);
+            if (main < 0) return List.of();
+            Rect secondary = new Rect();
+            for (int index = 0; index < panes.length; index++) {
+                if (index != main) secondary.union(panes[index]);
+            }
+            addTwoPaneDivider(edges, new Rect[]{secondary, panes[main]}, false, radius, density);
+        }
+        if (count == 4) {
+            java.util.Arrays.sort(panes, java.util.Comparator.comparingInt(rect -> rect.left));
+            for (int index = 0; index < panes.length - 1; index++) {
+                addPaneDivider(edges, panes[index], panes[index + 1], false, radius, density, index);
+            }
         }
         return edges;
+    }
+
+    private static void drawPaneDividers(View view, android.graphics.Canvas drawing) {
+        List<PaneEdge> edges = resizeEdges(view);
+        if (edges.isEmpty()) return;
+        int[] location = new int[2];
+        view.getLocationOnScreen(location);
+        float scale = (Float) XposedHelpers.callMethod(view, "getParentScaleX");
+        if (scale <= 0f) return;
+        float density = view.getResources().getDisplayMetrics().density;
+        drawing.save();
+        drawing.scale(1f / scale, 1f / scale);
+        drawing.translate(-location[0], -location[1]);
+        for (PaneEdge edge : edges) {
+            if (edge.bottomEdge()) continue;
+            Rect hit = edge.hit();
+            float x = hit.exactCenterX();
+            float y = hit.exactCenterY();
+            float halfLength = 22f * density;
+            float halfThickness = 2f * density;
+            float border = 0.6f * density;
+            float halfWidth = edge.horizontal() ? Math.min(hit.width() / 2f, halfLength) : halfThickness;
+            float halfHeight = edge.horizontal() ? halfThickness : Math.min(hit.height() / 2f, halfLength);
+            if (halfWidth <= border || halfHeight <= border) continue;
+            DIVIDER_PAINT.setColor(0xff48799f);
+            drawing.drawRoundRect(x - halfWidth, y - halfHeight, x + halfWidth, y + halfHeight,
+                    halfThickness, halfThickness, DIVIDER_PAINT);
+            DIVIDER_PAINT.setColor(DIVIDER_BLUE);
+            float innerRadius = halfThickness - border;
+            drawing.drawRoundRect(x - halfWidth + border, y - halfHeight + border,
+                    x + halfWidth - border, y + halfHeight - border,
+                    innerRadius, innerRadius, DIVIDER_PAINT);
+        }
+        drawing.restore();
     }
 
     private static void addTwoPaneDivider(List<PaneEdge> edges, Rect[] panes, boolean stacked,
@@ -641,21 +689,34 @@ final class CanvasLayout {
         boolean firstInOrder = stacked ? panes[0].top < panes[1].top : panes[0].left < panes[1].left;
         Rect first = panes[firstInOrder ? 0 : 1];
         Rect second = panes[firstInOrder ? 1 : 0];
-        int start = stacked ? Math.max(first.left, second.left) : Math.max(first.top, second.top);
-        int end = stacked ? Math.min(first.right, second.right) : Math.min(first.bottom, second.bottom);
+        addPaneDivider(edges, first, second, stacked, radius, density, PRIMARY_DIVIDER);
+    }
+
+    private static void addPaneDivider(List<PaneEdge> edges, Rect first, Rect second, boolean horizontal,
+                                       int radius, float density, int index) {
+        int start = horizontal ? Math.max(first.left, second.left) : Math.max(first.top, second.top);
+        int end = horizontal ? Math.min(first.right, second.right) : Math.min(first.bottom, second.bottom);
         int middle = (start + end) / 2;
-        int dividerRadius = Math.round(32 * density);
+        int dividerRadius = Math.round(38 * density);
         if (start < end) {
             int low = Math.max(start, middle - dividerRadius);
             int high = Math.min(end, middle + dividerRadius);
-            int seam = stacked ? (first.bottom + second.top) / 2 : (first.right + second.left) / 2;
-            Rect hit = stacked ? new Rect(low, seam - radius, high, seam + radius)
+            int seam = horizontal ? (first.bottom + second.top) / 2 : (first.right + second.left) / 2;
+            Rect hit = horizontal ? new Rect(low, seam - radius, high, seam + radius)
                     : new Rect(seam - radius, low, seam + radius, high);
-            edges.add(new PaneEdge(hit, -1, false, true, stacked ? 0 : 1, stacked ? 1 : 0, true));
+            edges.add(new PaneEdge(hit, index, horizontal));
         }
     }
 
     private static void hookPaneResizeTouch(ClassLoader loader) {
+        XposedHelpers.findAndHookMethod(android.view.ViewGroup.class, "dispatchDraw",
+                android.graphics.Canvas.class, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        if (CanvasApi.VIEW.equals(param.thisObject.getClass().getName())) {
+                            drawPaneDividers((View) param.thisObject, (android.graphics.Canvas) param.args[0]);
+                        }
+                    }
+                });
         XposedHelpers.findAndHookMethod(Activity.class, "dispatchTouchEvent", MotionEvent.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam param) {
@@ -717,55 +778,68 @@ final class CanvasLayout {
         final CanvasDisplay display;
         final int count;
         final String layoutKey;
-        final int slot;
-        final Rect slotBounds;
-        final PaneInsets startInsets;
+        final boolean dividerStream;
+        final long downTime;
         final float startX;
         final float startY;
         final float startShare;
-        final int startHeight;
-        final int startWidth;
+        final float direction;
+        final int dividerSpan;
         final float scale;
         boolean resizing;
-        PaneInsets insets;
+        int heightDelta;
         float share;
-        int height;
-        int width;
 
-        PaneEdgeDrag(View canvas, PaneEdge edge, MotionEvent event) {
+        PaneEdgeDrag(View canvas, PaneEdge edge, MotionEvent event, boolean dividerStream) {
             this.edge = edge;
+            this.dividerStream = dividerStream;
+            downTime = event.getDownTime();
             display = canvasDisplay(canvas);
             Object adapter = CanvasApi.adapter(canvas);
             count = count(adapter);
             int mode = layoutMode(adapter);
-            int index = edge.index();
-            if (index >= 0 && CanvasGeometry.mainPane(count, mainPaneMode(canvas, adapter)) >= 0) {
-                int[] order = panePositions(canvas, adapter);
-                if (order != null) index = order[index];
-            }
             layoutKey = paneLayoutKey(count, mode, isLandscape(canvas), display.stacked());
-            slot = index;
-            List<Rect> slots = basePanes(count, mode, columnShare(canvas, count, mode), display);
-            slotBounds = slot >= 0 && slot < slots.size() ? slots.get(slot) : new Rect();
-            startInsets = count >= 3 && slot >= 0 ? readPaneInsets(layoutPrefs(canvas.getContext()),
-                    layoutKey, slot) : PaneInsets.NONE;
-            insets = startInsets;
             startX = event.getRawX();
             startY = event.getRawY();
-            startShare = display.stacked() ? display.stackedShare() : columnShare(canvas, count, mode);
+            if (count == 4) {
+                startShare = display.fourDividers()[edge.index()];
+                dividerSpan = display.availableWidth() - 3 * columnGap();
+            } else if (edge.horizontal()) {
+                startShare = display.stackedShare();
+                dividerSpan = (count == 3 ? display.threeStackedHeight() : display.availableHeight()) - columnGap();
+            } else {
+                startShare = columnShare(canvas, count, mode);
+                dividerSpan = count == 3 && mode != THREE_STACKED_MODE
+                        ? display.availableWidth() - (display.landscape() ? 2 : 1) * columnGap()
+                        : display.area().width() - columnGap();
+            }
+            int mainMode = display.landscape() ? DEFAULT_ORIENTATION : mode;
+            direction = isMainPaneReversed(count, mainMode, display.preferredMainPaneMode()) ? -1f : 1f;
             share = startShare;
-            startHeight = twoPaneHeightPercent(display, edge.main());
-            height = startHeight;
-            startWidth = display.stacked() && !edge.divider()
-                    ? stackedWindowWidth(canvas, edge.leftPane(), false) : 100;
-            width = startWidth;
             scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
-            resizing = !edge.divider();
         }
 
         boolean matches(View canvas, int currentCount, int mode, boolean stacked) {
             return count == currentCount
                     && layoutKey.equals(paneLayoutKey(currentCount, mode, isLandscape(canvas), stacked));
+        }
+
+        float distance(MotionEvent event) {
+            return edge.horizontal() ? event.getRawY() - startY : event.getRawX() - startX;
+        }
+
+        boolean resizesHeight(boolean main) {
+            return edge.index() == (main ? MAIN_BOTTOM_EDGE : SECONDARY_BOTTOM_EDGE);
+        }
+
+        int resizedHeight(boolean main) {
+            int height = twoPaneHeightPercent(display, main) + heightDelta;
+            return Math.max(MIN_TWO_PANE_HEIGHT, Math.min(100 - twoPaneTopPercent(display, main), height));
+        }
+
+        String preference() {
+            if (count == 4) return layoutKey + "_divider_" + edge.index();
+            return layoutKey + (edge.index() == UPPER_COLUMNS_DIVIDER ? "_upper_columns" : "_share");
         }
     }
 
@@ -773,19 +847,22 @@ final class CanvasLayout {
         int action = event.getActionMasked();
         PaneEdgeDrag drag = paneEdgeDrags.get(canvas);
         if (action == MotionEvent.ACTION_DOWN) {
+            if (drag != null && drag.downTime == event.getDownTime()) return drag.dividerStream == dividerStream;
             for (PaneEdge edge : resizeEdges(canvas)) {
-                if (edge.hit().contains((int) event.getRawX(), (int) event.getRawY())) {
-                    if (edge.divider() != dividerStream) return false;
-                    paneEdgeDrags.put(canvas, new PaneEdgeDrag(canvas, edge, event));
+                if (edge.hit().contains((int) event.getRawX(), (int) event.getRawY())
+                        && (edge.bottomEdge() || (edge.index() < 0) == dividerStream)) {
+                    paneEdgeDrags.put(canvas, new PaneEdgeDrag(canvas, edge, event, dividerStream));
                     return true;
                 }
             }
             return false;
         }
-        if (drag == null || drag.edge.divider() != dividerStream) return false;
+        if (drag == null || drag.dividerStream != dividerStream || drag.downTime != event.getDownTime()) {
+            return false;
+        }
         Object adapter = CanvasApi.adapter(canvas);
         int count = adapter == null ? 0 : count(adapter);
-        boolean stacked = count == 2 && stackedTwoPanes(canvas.getContext());
+        boolean stacked = count == 2 && twoPanesStacked(canvas.getContext());
         if (count != drag.count || layoutLocked(canvas.getContext())
                 || !drag.matches(canvas, count, layoutMode(adapter), stacked)) {
             cancelPaneEdgeDrag(canvas);
@@ -794,15 +871,15 @@ final class CanvasLayout {
         }
         if (!drag.resizing) {
             int slop = android.view.ViewConfiguration.get(canvas.getContext()).getScaledTouchSlop();
-            float distance = drag.display.stacked() ? event.getRawY() - drag.startY : event.getRawX() - drag.startX;
-            if (action == MotionEvent.ACTION_MOVE && Math.abs(distance) > slop) {
+            if (action == MotionEvent.ACTION_MOVE && Math.abs(drag.distance(event)) > slop) {
                 drag.resizing = true;
             } else {
                 if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL
                         || action == MotionEvent.ACTION_POINTER_DOWN) {
                     paneEdgeDrags.remove(canvas);
-                    if (action == MotionEvent.ACTION_UP && edgeContainsTap(drag, event, slop)) {
-                        showTwoPaneDividerMenu(canvas, event);
+                    if (drag.edge.index() == PRIMARY_DIVIDER && action == MotionEvent.ACTION_UP
+                            && edgeContainsTap(drag, event, slop)) {
+                        showDividerMenu(canvas, event);
                     }
                 }
                 return true;
@@ -821,22 +898,19 @@ final class CanvasLayout {
     }
 
     private static void savePaneResize(View canvas, PaneEdgeDrag drag) {
-        var editor = layoutPrefs(canvas.getContext()).edit();
-        if (drag.share != drag.startShare && drag.count == 2) {
-            editor.putFloat(drag.layoutKey + "_share", drag.share);
+        if (drag.edge.bottomEdge()) {
+            boolean main = drag.resizesHeight(true);
+            int height = drag.resizedHeight(main);
+            if (height == twoPaneHeightPercent(drag.display, main)) return;
+            layoutPrefs(canvas.getContext()).edit().putInt(twoPaneHeightKey(false, main), height)
+                    .putInt(twoPaneTopKey(main), twoPaneTopPercent(drag.display, main)).apply();
+            log("window height resized main=" + main + " height=" + height);
+            return;
         }
-        if (!drag.insets.equals(drag.startInsets)) {
-            savePaneInsets(editor, drag.layoutKey, drag.slot, drag.insets);
-        }
-        if (drag.count == 2 && !drag.display.stacked() && drag.height != drag.startHeight) {
-            editor.putInt(twoPaneHeightKey(drag.display.landscape(), drag.edge.main()), drag.height);
-        }
-        if (drag.display.stacked() && drag.width != drag.startWidth) {
-            saveStackedWindowWidth(editor, stackedWidthKey(canvas, drag.edge.leftPane()), drag.width);
-        }
-        editor.apply();
+        if (drag.share == drag.startShare) return;
+        layoutPrefs(canvas.getContext()).edit().putFloat(drag.preference(), drag.share).apply();
         log("window resize count=" + drag.count + " stacked=" + drag.display.stacked()
-                + " pane=" + drag.edge.index() + " divider=" + drag.edge.divider());
+                + " divider=" + drag.edge.index() + " share=" + drag.share);
     }
 
     private static boolean edgeContainsTap(PaneEdgeDrag drag, MotionEvent event, int slop) {
@@ -844,70 +918,40 @@ final class CanvasLayout {
                 && Math.abs(event.getRawY() - drag.startY) <= slop;
     }
 
-    private static void showTwoPaneDividerMenu(View canvas, MotionEvent event) {
+    private static void showDividerMenu(View canvas, MotionEvent event) {
         Object bar = fieldOfTypeDeep(canvas, SPLIT_BAR.value());
         Object handle = bar == null ? null : XposedHelpers.callMethod(bar, "X", event);
         if (handle != null) XposedHelpers.callMethod(bar, "q0", handle);
     }
 
     private static void updatePaneEdgeSize(View canvas, PaneEdgeDrag drag, MotionEvent event) {
-        if (drag.scale <= 0f || drag.display.availableHeight() <= 0) return;
-        if (drag.count >= 3) {
-            if (drag.slotBounds.isEmpty()) return;
-            float dx = (event.getRawX() - drag.startX) / (drag.slotBounds.width() * drag.scale);
-            float dy = (event.getRawY() - drag.startY) / (drag.slotBounds.height() * drag.scale);
-            PaneInsets resize = drag.startInsets.move(drag.edge.horizontal(), drag.edge.vertical(), dx, dy);
-            if (!resize.equals(drag.insets)) {
-                drag.insets = resize;
+        if (drag.scale <= 0f || drag.dividerSpan <= 0) return;
+        if (drag.edge.bottomEdge()) {
+            int height = drag.display.availableHeight();
+            if (height <= 0) return;
+            int delta = Math.round(100f * drag.distance(event) / (height * drag.scale));
+            if (delta != drag.heightDelta) {
+                drag.heightDelta = delta;
                 requestPaneLayout(canvas);
             }
             return;
         }
-        if (drag.display.stacked()) {
-            int previousWidth = drag.width;
-            if (drag.edge.horizontal() != 0 && !drag.slotBounds.isEmpty()) {
-                float dx = (event.getRawX() - drag.startX) / (drag.slotBounds.width() * drag.scale);
-                int width = drag.startWidth + Math.round(200f * drag.edge.horizontal() * dx);
-                drag.width = Math.max(MIN_STACKED_WIDTH, Math.min(100, width));
-            }
-            boolean changed = drag.width != previousWidth;
-            if (drag.edge.vertical() == 0) {
-                if (changed) requestPaneLayout(canvas);
-                return;
-            }
-            float direction = drag.display.preferredMainPaneMode() == 6 ? -1f : 1f;
-            if (!drag.edge.leftPane()) direction = -direction;
-            float share = CanvasGeometry.clampLeftShare(drag.startShare + direction * drag.edge.vertical()
-                    * (event.getRawY() - drag.startY) / ((drag.display.availableHeight() - columnGap()) * drag.scale));
-            if (share != drag.share) {
-                drag.share = share;
-                changed = true;
-            }
-            if (changed) requestPaneLayout(canvas);
-            return;
+        float value = drag.startShare + drag.direction * drag.distance(event) / (drag.dividerSpan * drag.scale);
+        float share = drag.count == 4
+                ? CanvasGeometry.clampFourDivider(value, drag.display.fourDividers(), drag.edge.index())
+                : CanvasGeometry.clampLeftShare(value);
+        if (drag.count == 3 && drag.edge.horizontal()) share = Math.min(0.60f, share);
+        if (share != drag.share) {
+            drag.share = share;
+            requestPaneLayout(canvas);
         }
-        int beforeHeight = drag.height;
-        float beforeShare = drag.share;
-        int heightChange = Math.round(drag.edge.vertical() * 200f * (event.getRawY() - drag.startY)
-                / (drag.display.availableHeight() * drag.scale));
-        drag.height = Math.max(MIN_TWO_PANE_HEIGHT, Math.min(100, drag.startHeight + heightChange));
-        if (drag.edge.horizontal() != 0) {
-            float direction = drag.display.preferredMainPaneMode() == 6 ? -1f : 1f;
-            if (!drag.edge.leftPane()) direction = -direction;
-            int width = drag.display.area().width() - columnGap();
-            if (width > 0) {
-                float delta = direction * drag.edge.horizontal() * (event.getRawX() - drag.startX)
-                        / (width * drag.scale);
-                drag.share = CanvasGeometry.clampLeftShare(drag.startShare + delta);
-            }
-        }
-        if (drag.height != beforeHeight || drag.share != beforeShare) requestPaneLayout(canvas);
     }
 
     private static void requestPaneLayout(View canvas) {
         layoutKeys.remove(canvas);
         XposedHelpers.callMethod(canvas, "setNeedUpdateFlexibleTaskViewFrameFlag", true);
         canvas.requestLayout();
+        canvas.invalidate();
     }
 
     private static void hookModernWindowMenu(ClassLoader loader) {
@@ -941,30 +985,35 @@ final class CanvasLayout {
                     if (main >= 0) {
                         items.add(1, autoMainMenuItem(builder, canvas.getContext(),
                                 autoMainWindow(canvas.getContext())));
-                        boolean onLeft = mainPaneModeOnScreen(canvas, adapter) == 6;
-                        boolean stacked = count(adapter) == 2 && stackedTwoPanes(canvas.getContext());
-                        items.add(2, windowMenuItem(builder,
-                                stacked ? (onLeft ? "主屏移到下方" : "主屏移到上方")
-                                        : (onLeft ? "主屏移到右边" : "主屏移到左边"),
-                                MOVE_MAIN_WINDOW_ACTION,
-                                android.R.drawable.ic_menu_sort_by_size));
+                        int nextRow = 2;
+                        if (layoutMode(adapter) != THREE_STACKED_MODE) {
+                            boolean onLeft = mainPaneModeOnScreen(canvas, adapter) == 6;
+                            boolean stacked = count(adapter) == 2 && twoPanesStacked(canvas.getContext());
+                            items.add(nextRow++, windowMenuItem(builder,
+                                    stacked ? (onLeft ? "主屏移到下方" : "主屏移到上方")
+                                            : (onLeft ? "主屏移到右边" : "主屏移到左边"),
+                                    MOVE_MAIN_WINDOW_ACTION, android.R.drawable.ic_menu_sort_by_size));
+                        }
                         if (main != index) {
-                            items.add(3, windowMenuItem(builder, "设为主窗口", MAIN_WINDOW_ACTION,
+                            items.add(nextRow++, windowMenuItem(builder, "设为主窗口", MAIN_WINDOW_ACTION,
                                     android.R.drawable.btn_star_big_off));
                         }
-                        if (count(adapter) == 2) {
-                            int layoutRow = main == index ? 3 : 4;
-                            items.add(layoutRow, windowMenuItem(builder,
-                                    stacked ? "切换为左右布局" : "切换为上下布局",
-                                    TWO_PANE_LAYOUT_ACTION, android.R.drawable.ic_menu_sort_by_size));
-                            if (stacked && !locked) {
-                                boolean top = isTopStackedWindow(canvas, adapter, index);
-                                int width = stackedWindowWidth(canvas, top, false);
-                                items.add(layoutRow + 1, windowMenuItem(builder,
-                                        width == 100 ? "切换为窄窗口" : "切换为宽窗口",
-                                        STACKED_WINDOW_WIDTH_ACTION, android.R.drawable.ic_menu_crop));
-                            }
+                    }
+                    if (count(adapter) == 2) {
+                        boolean stacked = twoPanesStacked(canvas.getContext());
+                        items.add(1, windowMenuItem(builder, stacked ? "切换为左右布局" : "切换为上下布局",
+                                TWO_PANE_LAYOUT_ACTION, android.R.drawable.ic_menu_sort_by_size));
+                        if (stacked && !locked && !isLandscape(canvas)) {
+                            boolean top = isTopStackedWindow(canvas, adapter, index);
+                            int width = stackedWindowWidth(canvas.getContext(), isLandscape(canvas), top, false);
+                            items.add(2, windowMenuItem(builder, width == 100 ? "切换为窄窗口" : "切换为宽窗口",
+                                    STACKED_WINDOW_WIDTH_ACTION, android.R.drawable.ic_menu_crop));
                         }
+                    }
+                    if (count(adapter) == 3 && !isLandscape(canvas)) {
+                        boolean stacked = layoutMode(adapter) == THREE_STACKED_MODE;
+                        items.add(1, windowMenuItem(builder, stacked ? "切换为左右布局" : "切换为上下布局",
+                                THREE_PANE_LAYOUT_ACTION, android.R.drawable.ic_menu_sort_by_size));
                     }
                     items.add(1, windowMenuItem(builder, locked ? "解锁布局" : "锁定布局",
                             LAYOUT_LOCK_ACTION, android.R.drawable.ic_lock_lock));
@@ -980,8 +1029,9 @@ final class CanvasLayout {
                             if (row < 0 || row >= items.size()) return;
                             int action = (Integer) XposedHelpers.callMethod(items.get(row), "m");
                             if (action != MAIN_WINDOW_ACTION && action != AUTO_MAIN_WINDOW_ACTION
-                                    && action != MOVE_MAIN_WINDOW_ACTION && action != TWO_PANE_LAYOUT_ACTION
-                                    && action != STACKED_WINDOW_WIDTH_ACTION && action != LAYOUT_LOCK_ACTION) return;
+                                    && action != MOVE_MAIN_WINDOW_ACTION && action != THREE_PANE_LAYOUT_ACTION
+                                    && action != TWO_PANE_LAYOUT_ACTION && action != LAYOUT_LOCK_ACTION
+                                    && action != STACKED_WINDOW_WIDTH_ACTION) return;
                             param.setResult(null);
                             View canvas = (View) XposedHelpers.getObjectField(owner, "n");
                             Object task = XposedHelpers.getObjectField(owner, "o");
@@ -992,6 +1042,12 @@ final class CanvasLayout {
                             popup.dismiss();
                             if (action == LAYOUT_LOCK_ACTION) {
                                 toggleLayoutLock(canvas);
+                                return;
+                            }
+                            if (action == THREE_PANE_LAYOUT_ACTION) {
+                                if (count(adapter) == 3 && !isLandscape(canvas)) {
+                                    toggleThreePaneLayout(canvas, adapter);
+                                }
                                 return;
                             }
                             if (mainPane(canvas, adapter) < 0) return;
@@ -1007,16 +1063,16 @@ final class CanvasLayout {
                                 moveMainWindow(canvas, adapter);
                                 return;
                             }
-                            if (action == TWO_PANE_LAYOUT_ACTION) {
-                                if (count(adapter) == 2) toggleTwoPaneLayout(canvas, adapter);
-                                return;
-                            }
                             int index = (Integer) XposedHelpers.callMethod(adapter, "getPosition", task);
                             if (index < 0) return;
-                            if (action == STACKED_WINDOW_WIDTH_ACTION) {
-                                if (count(adapter) == 2 && stackedTwoPanes(canvas.getContext())) {
-                                    toggleStackedWindowWidth(canvas, adapter, index);
+                            if (action == TWO_PANE_LAYOUT_ACTION) {
+                                if (count(adapter) == 2) {
+                                    toggleTwoPaneLayout(canvas, adapter);
                                 }
+                                return;
+                            }
+                            if (action == STACKED_WINDOW_WIDTH_ACTION) {
+                                if (count(adapter) == 2) toggleStackedWindowWidth(canvas, adapter, index);
                                 return;
                             }
                             selectMainPane(canvas, adapter, index);
@@ -1543,22 +1599,12 @@ final class CanvasLayout {
                 - (canvas.getTop() + union.top) * scale;
     }
 
-    private static Rect overviewBounds(View canvas, int count) {
-        if (count < 3) return contentRect(canvas);
-        Object adapter = CanvasApi.adapter(canvas);
-        if (adapter == null) return contentRect(canvas);
-        int mode = layoutMode(adapter);
-        CanvasDisplay display = canvasDisplay(canvas);
-        for (PaneInsets insets : display.paneInsets()) {
-            if (insets == null) continue;
-            // 缩小单窗时仍用原来的总览坐标，其他窗格不随拖动平移。
-            Rect union = new Rect();
-            for (Rect slot : basePanes(count, mode, columnShare(canvas, count, mode), display)) {
-                union.union(slot);
-            }
-            if (!union.isEmpty()) return union;
+    private static Rect overviewBounds(View canvas, int panes) {
+        Rect bounds = contentRect(canvas);
+        if (bounds == null || panes != 2 || isLandscape(canvas) || twoPanesStacked(canvas.getContext())) {
+            return bounds;
         }
-        return contentRect(canvas);
+        return new Rect(bounds.left, 0, bounds.right, canvasDisplay(canvas).availableHeight());
     }
 
     /** 在同一次布局里提交窗格和画布坐标，避免新窗格先用上一套平移量画一帧。 */
@@ -1569,7 +1615,9 @@ final class CanvasLayout {
         Rect area = canvasArea(canvas);
         boolean landscape = isLandscape(canvas);
         int margin = landscape ? 0 : marginPx();
-        boolean alignTop = !landscape && panes == 4;
+        Object adapter = CanvasApi.adapter(canvas);
+        boolean alignTop = !landscape && (panes == 4
+                || (panes == 3 && adapter != null && layoutMode(adapter) == THREE_STACKED_MODE));
         float topInset = area.top + (alignTop ? 0 : margin);
         float availableHeight = area.bottom - topInset - margin;
         float scale = overviewScale(area.width(), union, availableHeight);
@@ -1900,7 +1948,7 @@ final class CanvasLayout {
         Object adapter = CanvasApi.adapter(canvas);
         CanvasDisplay display = canvasDisplay(canvas);
         int mode = DEFAULT_ORIENTATION;
-        List<Rect> panes = proportionalPanes(2, mode, columnShare(canvas, 2, mode), display);
+        List<Rect> panes = basePanes(2, mode, columnShare(canvas, 2, mode), display);
         if (panes.size() != 2) return panes;
 
         Rect union = new Rect();
@@ -2062,7 +2110,8 @@ final class CanvasLayout {
                             Float share = layoutColumnShare.get();
                             CanvasDisplay display = layoutDisplay.get();
                             if (display == null) display = fallbackCanvasDisplay();
-                            java.util.List<Rect> panes = proportionalPanes(count, mode,
+                            mode = effectiveThreePaneMode(mode, display.landscape());
+                            java.util.List<Rect> panes = basePanes(count, mode,
                                     share != null ? share : display.landscape() ? CanvasGeometry.LANDSCAPE_LEFT_SHARE
                                             : CanvasGeometry.defaultLeftShare(count, mode), display);
                             if (panes.size() != count) return;
@@ -2188,8 +2237,13 @@ final class CanvasLayout {
                             Object list = param.args[0];
                             if (!(list instanceof java.util.List)) return;
                             if (((java.util.List<?>) list).size() != 3) return;
-                            param.args[1] = forced;
-                            log("force orientation " + forced);
+                            CanvasDisplay display = layoutDisplay.get();
+                            boolean landscape = display != null ? display.landscape()
+                                    : android.content.res.Resources.getSystem().getConfiguration().orientation
+                                            == Configuration.ORIENTATION_LANDSCAPE;
+                            int mode = CanvasApi.isColorOs17() ? effectiveThreePaneMode(forced, landscape) : forced;
+                            param.args[1] = mode;
+                            log("force orientation " + mode);
                         }
                     });
             log("orientation hooked");
@@ -2270,7 +2324,7 @@ final class CanvasLayout {
     }
 
     /**
-     * 双窗拖动时更新应用布局，其他布局松手时提交窗格尺寸。
+     * 由 CanvasPlus 的分隔条处理尺寸变化，阻止系统提交另一套布局。
      */
     private static void hookDragLock(ClassLoader loader) {
         try {
@@ -2288,11 +2342,6 @@ final class CanvasLayout {
                                 Object adapter = CanvasApi.adapter(container);
                                 if (adapter != null && usesCanvasLayout(count(adapter))) {
                                     param.setResult(null);
-                                    if (CanvasApi.isColorOs17()) {
-                                        previewColumnDrag(param.thisObject, (View) container, adapter,
-                                                param.args[0], (MotionEvent) param.args[1],
-                                                (MotionEvent) param.args[2]);
-                                    }
                                 }
                             } catch (Throwable ignored) {
                             }
@@ -2315,7 +2364,7 @@ final class CanvasLayout {
                         }
                     });
             if (CanvasApi.isColorOs17()) {
-                hookColumnDragEnd(loader, bar);
+                hookColumnDragEnd(bar);
                 hookColumnHandles(bar);
                 hookWindowHeaderDrag(loader);
                 hookTwoPaneDividerMenu(bar, item);
@@ -2347,7 +2396,7 @@ final class CanvasLayout {
                 Object handle = param.getResult();
                 if (handle == null) return;
                 ImageView icon = (ImageView) XposedHelpers.callMethod(handle, "h");
-                if (icon != null) icon.setImageTintList(ColorStateList.valueOf(DIVIDER_BLUE));
+                if (icon != null) icon.setAlpha(0f);
             }
 
             @Override protected void beforeHookedMethod(MethodHookParam param) {
@@ -2356,7 +2405,7 @@ final class CanvasLayout {
                 if (adapter == null || count(adapter) < 2) return;
                 Rect first = (Rect) param.args[0];
                 Rect second = (Rect) param.args[1];
-                if (count(adapter) == 2 && stackedTwoPanes(((View) canvas).getContext())) {
+                if (count(adapter) == 2 && twoPanesStacked(((View) canvas).getContext())) {
                     int left = Math.max(first.left, second.left);
                     int right = Math.min(first.right, second.right);
                     if (left >= right) param.setResult(null);
@@ -2403,123 +2452,31 @@ final class CanvasLayout {
                         Object canvas = XposedHelpers.getObjectField(param.thisObject, "n");
                         Object adapter = CanvasApi.adapter(canvas);
                         if (adapter != null && count(adapter) >= 2) {
-                            // 多窗通过分隔条调节，标题按钮继续走原生点击菜单。
+                            // 窗口菜单继续使用系统点击动作。
                             param.setResult(Boolean.FALSE);
                         }
                     }
                 });
-    }
-
-    private static final java.util.WeakHashMap<Object, ColumnDrag> columnDrags =
-            new java.util.WeakHashMap<>();
-
-    private record ColumnDrag(View canvas, View handle, long downTime, int panes, int mode,
-                              boolean landscape, boolean reversed, float initialShare, float screenWidth) {
-        float shareAt(MotionEvent event, float startX) {
-            return CanvasGeometry.clampLeftShare(initialShare
-                    + direction() * (event.getRawX() - startX) / screenWidth);
-        }
-
-        int direction() {
-            return reversed ? -1 : 1;
-        }
-
-        void clearPreview() {
-            handle.setTranslationX(0f);
-        }
-    }
-
-    private static void previewColumnDrag(Object bar, View canvas, Object adapter, Object item,
-                                          MotionEvent start, MotionEvent current) {
-        int total = count(adapter);
-        if (total == 2 || layoutLocked(canvas.getContext())) return;
-        int mode = layoutMode(adapter);
-        boolean landscape = isLandscape(canvas);
-        boolean reversed = isMainPaneReversed(total, landscape ? DEFAULT_ORIENTATION : mode,
-                preferredMainPaneMode(canvas.getContext()));
-        if (isFourZoomed(canvas) || current.getPointerCount() != 1
-                || (landscape ? total != 3 : !CanvasGeometry.hasPhoneRatioColumns(total, mode))
-                || !Boolean.TRUE.equals(XposedHelpers.callMethod(item, "k"))) return;
-
-        ColumnDrag drag = columnDrags.get(bar);
-        if (drag == null || drag.downTime() != start.getDownTime()) {
-            if (drag != null) drag.clearPreview();
-            float scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
-            Rect bounds = contentRect(canvas);
-            if (bounds == null) return;
-            int width = bounds.width() - columnGap() * (landscape ? 2 : 1);
-            if (width <= 0 || scale <= 0f) return;
-            View handle = (View) XposedHelpers.callMethod(item, "g");
-            drag = new ColumnDrag(canvas, handle, start.getDownTime(), total, mode,
-                    landscape, reversed, columnShare(canvas, total, mode), width * scale);
-            columnDrags.put(bar, drag);
-        }
-        float scale = (Float) XposedHelpers.callMethod(canvas, "getParentScaleX");
-        if (scale > 0f) {
-            float shift = (drag.shareAt(current, start.getRawX()) - drag.initialShare())
-                    * drag.direction() * drag.screenWidth() / scale;
-            drag.handle().setTranslationX(shift);
-        }
-    }
-
-    private static void hookColumnDragEnd(ClassLoader loader, Class<?> bar) {
-        XposedHelpers.findAndHookMethod(bar, "u0", MotionEvent.class, int.class, int.class,
-                new XC_MethodHook() {
-                    @Override protected void beforeHookedMethod(MethodHookParam param) {
-                        try {
-                            Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
-                            Object adapter = CanvasApi.adapter(canvas);
-                            if (adapter == null || count(adapter) < 2) return;
-                            param.setResult(null);
-                            ColumnDrag drag = columnDrags.remove(param.thisObject);
-                            if (drag == null) return;
-                            drag.clearPreview();
-                            MotionEvent end = (MotionEvent) param.args[0];
-                            if (layoutLocked(drag.canvas().getContext())
-                                    || end.getActionMasked() != MotionEvent.ACTION_UP
-                                    || end.getDownTime() != drag.downTime()
-                                    || count(adapter) != drag.panes() || isFourZoomed(canvas)
-                                    || isLandscape(drag.canvas()) != drag.landscape()
-                                    || layoutMode(adapter) != drag.mode()
-                                    || drag.reversed() != isMainPaneReversed(drag.panes(),
-                                            drag.landscape() ? DEFAULT_ORIENTATION : drag.mode(),
-                                            preferredMainPaneMode(drag.canvas().getContext()))) return;
-                            float share = drag.shareAt(end, (Integer) param.args[1]);
-                            if (Math.abs(share - drag.initialShare()) < 0.002f) return;
-                            String key = paneLayoutKey(drag.panes(), drag.mode(), drag.landscape(), false);
-                            layoutPrefs(drag.canvas().getContext()).edit().putFloat(key + "_share", share).apply();
-                            requestPaneLayout(drag.canvas());
-                            log("column resize " + drag.panes() + " windows left=" + share);
-                        } catch (Throwable error) {
-                            log("column resize failed: " + error);
-                        }
-                    }
-                });
-        Class<?> gestures = XposedHelpers.findClass(CanvasApi.PACKAGE + "A", loader);
-        XposedHelpers.findAndHookMethod(gestures, "T", MotionEvent.class, new XC_MethodHook() {
-            @Override protected void afterHookedMethod(MethodHookParam param) {
-                MotionEvent event = (MotionEvent) param.args[0];
-                if (event.getActionMasked() != MotionEvent.ACTION_CANCEL
-                        && event.getActionMasked() != MotionEvent.ACTION_UP
-                        && event.getActionMasked() != MotionEvent.ACTION_POINTER_DOWN) return;
-                for (java.util.Iterator<ColumnDrag> iterator = columnDrags.values().iterator();
-                        iterator.hasNext(); ) {
-                    ColumnDrag drag = iterator.next();
-                    if (drag.downTime() != event.getDownTime()) continue;
-                    drag.clearPreview();
-                    iterator.remove();
-                }
+        XposedHelpers.findAndHookMethod(header, "l0", Rect.class, int.class, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                Object canvas = XposedHelpers.getObjectField(param.thisObject, "n");
+                Object adapter = CanvasApi.adapter(canvas);
+                if (adapter != null && count(adapter) >= 2 && count(adapter) <= 4) param.setResult(1f);
             }
         });
     }
 
+    private static void hookColumnDragEnd(Class<?> bar) {
+        XposedHelpers.findAndHookMethod(bar, "u0", MotionEvent.class, int.class, int.class,
+                new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
+                        Object adapter = CanvasApi.adapter(canvas);
+                        if (adapter != null && count(adapter) >= 2) param.setResult(null);
+                    }
+                });
+    }
 
-    /**
-     * 让 u1/d.o() 永远返回目标尺寸。
-     *
-     * 任务数据重建时 a 字段会被改回方形，M1 跟着算出方形窗口，
-     * 就是那个重排。这里直接锁死返回值，布局指纹才不会变。
-     */
     private static void hookTaskDataBounds(ClassLoader loader) {
         try {
             Class<?> taskData = XposedHelpers.findClass(TASK.value(), loader);
@@ -3003,22 +2960,39 @@ final class CanvasLayout {
         boolean landscape = isLandscape(view);
         float initial = landscape && count != 2 ? CanvasGeometry.LANDSCAPE_LEFT_SHARE
                 : CanvasGeometry.defaultLeftShare(count, mode);
-        if (count < 2 || count > 4) return initial;
+        if (count < 2 || count > 4 || (count == 4 && !landscape)) return initial;
         PaneEdgeDrag drag = paneEdgeDrags.get(view);
-        if (count == 2 && drag != null && drag.matches(view, count, mode, false)) return drag.share;
+        boolean upperColumns = count == 3 && mode == THREE_STACKED_MODE;
+        if (drag != null && !drag.edge.horizontal() && count <= 3
+                && drag.matches(view, count, mode, false)) return drag.share;
         String key = paneLayoutKey(count, mode, landscape, false);
-        return layoutPrefs(view.getContext()).getFloat(key + "_share", initial);
+        return layoutPrefs(view.getContext()).getFloat(key + (upperColumns ? "_upper_columns" : "_share"),
+                initial);
+    }
+
+    private static int effectiveThreePaneMode(int mode, boolean landscape) {
+        return landscape && mode == THREE_STACKED_MODE ? DEFAULT_ORIENTATION : mode;
     }
 
     private static int layoutMode(Object adapter) {
-        if (count(adapter) == 2) return DEFAULT_ORIENTATION;
-        return forcedOrientation != 0 ? forcedOrientation : (Integer) XposedHelpers.callMethod(adapter, "n");
+        int count = count(adapter);
+        if (count == 2) return DEFAULT_ORIENTATION;
+        int mode = forcedOrientation != 0 ? forcedOrientation : (Integer) XposedHelpers.callMethod(adapter, "n");
+        return count == 3 ? effectiveThreePaneModeForAdapter(mode, adapter) : mode;
+    }
+
+    private static int effectiveThreePaneModeForAdapter(int mode, Object adapter) {
+        if (mode != THREE_STACKED_MODE || !CanvasApi.isColorOs17()) return mode;
+        Context context = (Context) XposedHelpers.callMethod(adapter, "getContext");
+        return effectiveThreePaneMode(mode,
+                context.getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE);
     }
 
     private record CanvasDisplay(Rect area, Rect portraitTask, boolean landscape,
                                  int preferredMainPaneMode, int twoPaneSecondaryHeight,
-                                 int twoPaneMainHeight, boolean stacked, float stackedShare,
-                                 PaneInsets[] paneInsets) {
+                                 int twoPaneMainHeight, int secondaryTop, int mainTop,
+                                 boolean stacked, float stackedShare,
+                                 int topWidth, int bottomWidth, float[] fourDividers) {
         int margin() {
             return landscape ? 0 : marginPx();
         }
@@ -3029,6 +3003,10 @@ final class CanvasLayout {
 
         int availableHeight() {
             return area.height() - 2 * margin();
+        }
+
+        int threeStackedHeight() {
+            return availableHeight() + margin();
         }
     }
 
@@ -3057,33 +3035,33 @@ final class CanvasLayout {
         PaneEdgeDrag drag = paneEdgeDrags.get(canvas);
         if (drag != null && (drag.display.landscape() != display.landscape()
                 || !drag.matches(canvas, count, mode, stacked))) drag = null;
-        PaneInsets[] geometry = new PaneInsets[count];
         var prefs = layoutPrefs(canvas.getContext());
         float stackedShare = DEFAULT_STACKED_SHARE;
-        if (stacked) {
-            stackedShare = drag == null ? prefs.getFloat(key + "_share", DEFAULT_STACKED_SHARE) : drag.share;
-            for (int slot = 0; slot < count; slot++) {
-                boolean top = slot == (display.preferredMainPaneMode() == 6 ? 1 : 0);
-                int width = drag != null && !drag.edge.divider() && drag.edge.leftPane() == top
-                        ? drag.width : stackedWindowWidth(canvas, top, false);
-                float inset = (100 - width) / 200f;
-                if (inset > 0f) geometry[slot] = new PaneInsets(inset, 0f, inset, 0f);
-            }
-        } else if (count >= 3 && count <= 4) {
-            for (int index = 0; index < count; index++) {
-                PaneInsets pane = drag != null && drag.slot == index
-                        ? drag.insets : readPaneInsets(prefs, key, index);
-                if (!pane.equals(PaneInsets.NONE)) geometry[index] = pane;
-            }
+        if (stacked || (count == 3 && mode == THREE_STACKED_MODE)) {
+            stackedShare = drag != null && drag.edge.horizontal() ? drag.share
+                    : prefs.getFloat(key + "_share", DEFAULT_STACKED_SHARE);
         }
-        int main = display.twoPaneMainHeight();
-        int secondary = display.twoPaneSecondaryHeight();
-        if (drag != null && count == 2 && !stacked && !drag.edge.divider()) {
-            if (drag.edge.main()) main = drag.height;
-            else secondary = drag.height;
+        float[] fourDividers = null;
+        if (count == 4 && landscape) {
+            fourDividers = new float[]{0.25f, 0.5f, 0.75f};
+            for (int index = 0; index < fourDividers.length; index++) {
+                fourDividers[index] = prefs.getFloat(key + "_divider_" + index, fourDividers[index]);
+            }
+            if (drag != null) fourDividers[drag.edge.index()] = drag.share;
         }
+        boolean resizeSecondary = drag != null && drag.resizesHeight(false);
+        boolean resizeMain = drag != null && drag.resizesHeight(true);
+        boolean allowNarrow = stacked && !landscape;
         return new CanvasDisplay(display.area(), display.portraitTask(), display.landscape(),
-                display.preferredMainPaneMode(), secondary, main, stacked, stackedShare, geometry);
+                display.preferredMainPaneMode(),
+                resizeSecondary ? drag.resizedHeight(false) : display.twoPaneSecondaryHeight(),
+                resizeMain ? drag.resizedHeight(true) : display.twoPaneMainHeight(),
+                resizeSecondary ? twoPaneTopPercent(drag.display, false) : display.secondaryTop(),
+                resizeMain ? twoPaneTopPercent(drag.display, true) : display.mainTop(),
+                stacked, stackedShare,
+                allowNarrow ? stackedWindowWidth(canvas.getContext(), false, true, false) : 100,
+                allowNarrow ? stackedWindowWidth(canvas.getContext(), false, false, false) : 100,
+                fourDividers);
     }
 
     private static CanvasDisplay fallbackCanvasDisplay() {
@@ -3097,32 +3075,50 @@ final class CanvasLayout {
         int mainSide = 0;
         int secondaryHeight = 0;
         int mainHeight = 0;
-        boolean stacked = context != null && stackedTwoPanes(context);
+        int secondaryTop = -1;
+        int mainTop = -1;
+        boolean stacked = context != null && twoPanesStacked(context);
         if (context != null) {
             var prefs = context.getSharedPreferences(Settings.PREFS, Context.MODE_PRIVATE);
-            mainSide = prefs.getInt(MAIN_WINDOW_SIDE, 0);
-            secondaryHeight = prefs.getInt(twoPaneHeightKey(landscape, false), 0);
-            mainHeight = prefs.getInt(twoPaneHeightKey(landscape, true), 0);
+            mainSide = preferredMainPaneMode(context);
+            if (!landscape) {
+                secondaryHeight = prefs.getInt(twoPaneHeightKey(false, false), 0);
+                mainHeight = prefs.getInt(twoPaneHeightKey(false, true), 0);
+                secondaryTop = prefs.getInt(twoPaneTopKey(false), -1);
+                mainTop = prefs.getInt(twoPaneTopKey(true), -1);
+            }
         }
         Rect portraitTask = new Rect(0, 0, Math.min(width, height),
                 Math.max(width, height) - statusBarHeight());
         if (!landscape) {
-            return new CanvasDisplay(new Rect(0, statusBarHeight(), width, height),
-                    portraitTask, false, mainSide, secondaryHeight, mainHeight, stacked,
-                    DEFAULT_STACKED_SHARE, new PaneInsets[0]);
+            int inset = windowInsets == null ? 0 : windowInsets.getInsetsIgnoringVisibility(
+                    WindowInsets.Type.statusBars() | WindowInsets.Type.displayCutout()).top;
+            int safeTop = inset > 0 ? inset : statusBarHeight();
+            return new CanvasDisplay(new Rect(0, safeTop, width, height),
+                    portraitTask, false, mainSide, secondaryHeight, mainHeight, secondaryTop, mainTop, stacked,
+                    DEFAULT_STACKED_SHARE, 100, 100, null);
         }
         // 横屏画布可进入挖孔区域，系统栏仍按实际占用空间计算。
         Insets insets = windowInsets == null ? Insets.NONE : windowInsets.getInsets(
                 WindowInsets.Type.navigationBars() | WindowInsets.Type.statusBars());
         Rect area = new Rect(insets.left, insets.top, width - insets.right, height - insets.bottom);
-        return new CanvasDisplay(area, portraitTask, true, mainSide, secondaryHeight, mainHeight, stacked,
-                DEFAULT_STACKED_SHARE, new PaneInsets[0]);
+        return new CanvasDisplay(area, portraitTask, true, mainSide, secondaryHeight, mainHeight, secondaryTop, mainTop, stacked,
+                DEFAULT_STACKED_SHARE, 100, 100, null);
+    }
+
+    private static String twoPaneTopKey(boolean main) {
+        return main ? "two_pane_top_portrait_main" : "two_pane_top_portrait_secondary";
+    }
+
+    private static int twoPaneTopPercent(CanvasDisplay display, boolean main) {
+        int top = main ? display.mainTop() : display.secondaryTop();
+        return top >= 0 ? top : (100 - twoPaneHeightPercent(display, main)) / 2;
     }
 
     private static int twoPaneHeightPercent(CanvasDisplay display, boolean main) {
+        if (display.landscape()) return 100;
         int saved = main ? display.twoPaneMainHeight() : display.twoPaneSecondaryHeight();
         if (saved > 0) return saved;
-        if (display.landscape()) return 100;
         float baselineShare = CanvasGeometry.defaultLeftShare(2, DEFAULT_ORIENTATION);
         float width = (display.availableWidth() - columnGap()) * (main ? 1f - baselineShare : baselineShare);
         Rect phone = display.portraitTask();
@@ -3130,33 +3126,43 @@ final class CanvasLayout {
         return Math.max(MIN_TWO_PANE_HEIGHT, Math.min(100, percent));
     }
 
-    private static List<Rect> proportionalPanes(int count, int mode, float leftShare, CanvasDisplay display) {
-        List<Rect> panes = basePanes(count, mode, leftShare, display);
-        for (int index = 0; index < Math.min(panes.size(), display.paneInsets().length); index++) {
-            PaneInsets insets = display.paneInsets()[index];
-            if (insets != null) panes.set(index, insets.apply(panes.get(index)));
-        }
-        return panes;
-    }
-
     private static List<Rect> basePanes(int count, int mode, float leftShare, CanvasDisplay display) {
-        int width = count == 2 ? display.area().width() : display.availableWidth();
-        int height = display.availableHeight();
+        boolean threeStacked = count == 3 && !display.landscape() && mode == THREE_STACKED_MODE;
+        int width = count == 2 || threeStacked ? display.area().width() : display.availableWidth();
+        int height = threeStacked ? display.threeStackedHeight() : display.availableHeight();
         List<Rect> panes;
         if (count == 2 && display.stacked()) {
-            return CanvasGeometry.twoStackedPanes(width, height, columnGap(), display.stackedShare(),
-                    display.preferredMainPaneMode() == 6);
+            boolean mainOnTop = display.preferredMainPaneMode() == 6;
+            List<Rect> rows = CanvasGeometry.twoStackedPanes(width, height, columnGap(),
+                    display.stackedShare(), mainOnTop);
+            if (rows.size() == 2) {
+                narrowStackedPane(rows.get(mainOnTop ? 1 : 0), display.topWidth());
+                narrowStackedPane(rows.get(mainOnTop ? 0 : 1), display.bottomWidth());
+            }
+            return rows;
         }
         if (count == 2) {
             int secondaryHeight = Math.round(height * twoPaneHeightPercent(display, false) / 100f);
             int mainHeight = Math.round(height * twoPaneHeightPercent(display, true) / 100f);
             panes = CanvasGeometry.twoPanes(width, height, columnGap(), leftShare,
                     secondaryHeight, mainHeight);
+            if (panes.size() == 2) {
+                if (display.secondaryTop() >= 0) {
+                    Rect secondary = panes.get(0);
+                    secondary.offsetTo(secondary.left, Math.round(height * display.secondaryTop() / 100f));
+                }
+                if (display.mainTop() >= 0) {
+                    Rect main = panes.get(1);
+                    main.offsetTo(main.left, Math.round(height * display.mainTop() / 100f));
+                }
+            }
+        } else if (threeStacked) {
+            panes = CanvasGeometry.threeStackedPanes(width, height, columnGap(), display.stackedShare(), leftShare);
         } else if (display.landscape()) {
-            panes = CanvasGeometry.landscapeRow(width, height, columnGap(), count, leftShare);
+            panes = CanvasGeometry.landscapeRow(width, height, columnGap(), count, leftShare, display.fourDividers());
         } else if (CanvasGeometry.hasPhoneRatioColumns(count, mode)) {
             panes = CanvasGeometry.phoneRatioColumns(width, height, columnGap(), count, mode,
-                    leftShare, display.portraitTask());
+                    count == 4 ? 0.5f : leftShare, display.portraitTask());
         } else {
             panes = CanvasGeometry.panes(width, height, columnGap(), count, mode, leftShare);
         }
@@ -3167,10 +3173,16 @@ final class CanvasLayout {
         return panes;
     }
 
+    private static void narrowStackedPane(Rect pane, int widthPercent) {
+        int width = Math.round(pane.width() * Math.max(30, Math.min(100, widthPercent)) / 100f);
+        pane.left += (pane.width() - width) / 2;
+        pane.right = pane.left + width;
+    }
+
     private static java.util.List<Rect> fourPanes() {
         if (CanvasApi.isColorOs17()) {
             CanvasDisplay display = layoutDisplay.get();
-            return proportionalPanes(4, 0, 0.5f, display == null ? fallbackCanvasDisplay() : display);
+            return basePanes(4, 0, 0.5f, display == null ? fallbackCanvasDisplay() : display);
         }
         Rect cell = phoneSize();
         int gap = Math.round(10f * android.content.res.Resources
@@ -3184,23 +3196,30 @@ final class CanvasLayout {
         CanvasDisplay display = canvasDisplay((View) canvas);
         Rect target = display.portraitTask();
         int mode = layoutMode(adapter);
-        if (count == 2) {
-            List<Rect> panes = proportionalPanes(count, mode, columnShare(canvas, count, mode), display);
-            if (panes.size() != count) return List.of(target, target);
+        boolean threeStacked = count == 3 && mode == THREE_STACKED_MODE;
+        if (count == 2 || threeStacked) {
+            List<Rect> panes = basePanes(count, mode, columnShare(canvas, count, mode), display);
+            if (panes.size() != count) return java.util.Collections.nCopies(count, target);
             float baseTaskScale = display.landscape() ? 1f : 1.5f;
             List<Rect> targets = new ArrayList<>(count);
             float referenceWidth = display.stacked() ? display.area().width()
                     : (display.area().width() - columnGap()) / 2f;
             int availableHeight = display.availableHeight();
             for (int slot = 0; slot < count; slot++) {
+                float paneReferenceWidth = referenceWidth;
                 float referenceHeight;
-                if (display.stacked()) {
+                if (threeStacked) {
+                    paneReferenceWidth = slot == 2 ? display.area().width() : (display.area().width() - columnGap()) / 2f;
+                    referenceHeight = (display.threeStackedHeight() - columnGap())
+                            * (slot == 2 ? 2f / 3f : 1f / 3f);
+                } else if (display.stacked()) {
                     referenceHeight = (availableHeight - columnGap()) * (slot == 0 ? 1f / 3f : 2f / 3f);
                 } else {
                     referenceHeight = display.landscape() ? availableHeight
                             : Math.min(availableHeight, referenceWidth * target.height() / target.width());
                 }
-                targets.add(responsiveTaskBounds(panes.get(slot), baseTaskScale, referenceWidth, referenceHeight));
+                float taskScale = threeStacked && slot < 2 ? baseTaskScale * 1.20f : baseTaskScale;
+                targets.add(responsiveTaskBounds(panes.get(slot), taskScale, paneReferenceWidth, referenceHeight));
             }
             return inTaskOrder(targets, panePositions(canvas, adapter));
         }
@@ -3208,7 +3227,7 @@ final class CanvasLayout {
                 : CanvasGeometry.defaultLeftShare(count, mode);
         List<Rect> baseline = basePanes(count, mode, initialShare, display);
         if (baseline.size() != count) return java.util.Collections.nCopies(count, target);
-        List<Rect> panes = proportionalPanes(count, mode, columnShare(canvas, count, mode), display);
+        List<Rect> panes = basePanes(count, mode, columnShare(canvas, count, mode), display);
         if (panes.size() != count) return java.util.Collections.nCopies(count, target);
         int mainSlot = CanvasGeometry.mainPane(count, mainPaneMode((View) canvas, adapter));
         int minWidth = Math.round(240f * android.content.res.Resources
@@ -3263,6 +3282,12 @@ final class CanvasLayout {
             Object adapter = CanvasApi.adapter(container);
             if (adapter == null) return;
             containers.put(container, Boolean.TRUE);
+            if (CanvasApi.isColorOs17() && !restoredThreePaneMode) {
+                restoredThreePaneMode = true;
+                if (forcedMode < 3 || forcedMode > 7) {
+                    forcedOrientation = savedThreePaneMode(((View) container).getContext());
+                }
+            }
             int count = count(adapter);
             Integer last = taskCounts.put(container, count);
             boolean restoreSystemSplit = !CanvasApi.isColorOs17() && last != null
@@ -3543,9 +3568,9 @@ final class CanvasLayout {
                         if (count != 3) return;
                         int mode;
                         if (CanvasApi.isColorOs17() && forcedOrientation >= 3 && forcedOrientation <= 7) {
-                            mode = forcedOrientation;
+                            mode = effectiveThreePaneModeForAdapter(forcedOrientation, adapter);
                         } else if (forcedMode >= 3 && forcedMode <= 7) {
-                            mode = forcedMode;
+                            mode = effectiveThreePaneModeForAdapter(forcedMode, adapter);
                         } else {
                             Object context = XposedHelpers.callMethod(adapter, "getContext");
                             int orientation = ((android.content.Context) context).getResources()
@@ -3664,18 +3689,22 @@ final class CanvasLayout {
     }
 
     private static void log(String message) {
-        XposedBridge.log(TAG + ": " + message);
+        ModuleEntry.log(message);
     }
 
-    /** 只打日志：多个窗口在屏幕上到底落在哪，圆角是不是被裁。 */
-    /** 只打关键信息：窗口数、每个窗口的布局矩形。 */
+    /** 记录有变化的窗格坐标和布局状态，方便还原用户的操作现场。 */
     private static void dumpLayout(Object view) {
         try {
             Object adapter = CanvasApi.adapter(view);
             int total = adapter == null ? 0 : count(adapter);
-            if (total == lastDumpedCount) return;
-            lastDumpedCount = total;
             StringBuilder sb = new StringBuilder("layout windows=").append(total);
+            if (CanvasApi.isColorOs17() && view instanceof View canvas && total >= 2) {
+                Context context = canvas.getContext();
+                sb.append(" landscape=").append(isLandscape(canvas))
+                        .append(" mode=").append(layoutMode(adapter))
+                        .append(" stacked=").append(total == 2 && twoPanesStacked(context))
+                        .append(" locked=").append(layoutLocked(context));
+            }
             for (int i = 0; i < total; i++) {
                 Object decor = XposedHelpers.callMethod(view, EMBEDDED_VIEW.value(), i);
                 if (!(decor instanceof android.view.View)) continue;
@@ -3684,11 +3713,14 @@ final class CanvasLayout {
                         .append(",").append(d.getRight()).append(",")
                         .append(d.getBottom()).append("]");
             }
-            log(sb.toString());
+            String layout = sb.toString();
+            if (layout.equals(lastDumpedLayout)) return;
+            lastDumpedLayout = layout;
+            log(layout);
         } catch (Throwable error) {
             log("dump failed: " + error);
         }
     }
 
-    private static volatile int lastDumpedCount = -1;
+    private static volatile String lastDumpedLayout;
 }

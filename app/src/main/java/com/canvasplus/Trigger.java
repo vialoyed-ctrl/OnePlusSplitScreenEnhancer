@@ -33,6 +33,9 @@ final class Trigger {
 
     private static final String ACTION_START = "com.canvasplus.START";
     private static final String ACTION_ADD = "com.canvasplus.ADD";
+    static final String EXTRA_LAUNCH = "launch";
+    static final String EXTRA_USER = "user";
+    private static final String FLEXIBLE_USER = "androidx.flexible.userId";
     private static final String ACTION_LAYOUT = "com.canvasplus.LAYOUT";
     private static final String EXTRA_PACKAGES = "packages";
     private static final String MANAGER = "com.oplus.flexiblewindow.FlexibleWindowManager";
@@ -108,21 +111,28 @@ final class Trigger {
                             setResultCode(0);
                             return;
                         }
+                        boolean fromSidebar = "com.coloros.smartsidebar".equals(getSentFromPackage());
+                        Intent launch = fromSidebar ? intent.getParcelableExtra(EXTRA_LAUNCH, Intent.class) : null;
+                        int userId = launch == null ? 0 : intent.getIntExtra(EXTRA_USER, 0);
+                        if (launch == null && intent.hasExtra(EXTRA_LAUNCH)) {
+                            if (isOrderedBroadcast()) setResultCode(0);
+                            return;
+                        }
                         Object activity = currentCanvas();
                         int count = activity == null ? -1 : canvasCount(activity);
                         boolean visible = isForeground(activity);
                         boolean room = count >= 0 && count < 4;
-                        log("add request " + pkg + " visible=" + visible + " count=" + count);
+                        log("add request " + pkg + " user=" + userId + " visible=" + visible + " count=" + count);
                         if (CanvasApi.isColorOs17()) {
                             boolean accepted = visible && room && count >= 2
-                                    && addOnColorOs17(context, activity, pkg, count);
+                                    && addOnColorOs17(context, activity, pkg, launch, userId, count);
                             if (isOrderedBroadcast()) setResultCode(accepted ? 1 : 0);
                             return;
                         }
                         if (intent.getBooleanExtra("ordered", false)) {
                             setResultCode(visible && room ? 1 : 0);
                         }
-                        if (visible && room) addToCanvas(context, pkg);
+                        if (visible && room) addToCanvas(context, pkg, launch, userId, 0);
                         return;
                     }
                     if (!ACTION_START.equals(intent.getAction())) return;
@@ -132,7 +142,7 @@ final class Trigger {
                     if (CanvasApi.isColorOs17()) {
                         CanvasLayout.forcedOrientation = CanvasLayout.forcedMode >= 3
                                 && CanvasLayout.forcedMode <= 7 ? CanvasLayout.forcedMode
-                                : CanvasLayout.DEFAULT_ORIENTATION;
+                                : CanvasLayout.savedThreePaneMode(context);
                     }
                     log("trigger " + Arrays.toString(packages) + " mode=" + CanvasLayout.forcedMode);
                     startPocketStudio(context, loader, packages);
@@ -153,23 +163,26 @@ final class Trigger {
 
     /** 给画布发 AddIntentToSplit，让它自己走 addFlexibleTask 添加窗口。 */
     /** 侧边栏点应用时，只有一个问题：现在该加进画布，还是照旧开小窗。 */
-    private static void addToCanvas(android.content.Context context, String pkg) {
-        addToCanvas(context, pkg, 0);
-    }
-
-    private static boolean addOnColorOs17(Context context, Object activity, String pkg, int before) {
-        Intent launch = context.getPackageManager().getLaunchIntentForPackage(pkg);
+    private static boolean addOnColorOs17(Context context, Object activity, String pkg, Intent selected,
+                                          int userId, int before) {
+        Intent launch = launchIntent(context, pkg, selected, userId);
         if (launch == null) return false;
-        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
-            XposedHelpers.callMethod(activity, ADD_TASK.value(), launch, 0, false);
+            XposedHelpers.callMethod(activity, ADD_TASK.value(), launch, userId, false);
         } catch (LinkageError | RuntimeException error) {
             log("add activity failed: " + error);
         }
-        if (canvasCount(activity) == before) addDirect(activity, launch);
+        if (canvasCount(activity) == before) addDirect(activity, launch, userId);
         int after = canvasCount(activity);
-        log("add " + pkg + " " + before + "->" + after);
+        log("add " + pkg + " user=" + userId + " " + before + "->" + after);
         return after > before;
+    }
+
+    private static Intent launchIntent(Context context, String pkg, Intent selected, int userId) {
+        Intent launch = selected == null ? context.getPackageManager().getLaunchIntentForPackage(pkg)
+                : new Intent(selected);
+        if (launch == null) return null;
+        return launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra(FLEXIBLE_USER, userId);
     }
 
     /** 加完窗口后画布可能还在动画里没重排，补一次。 */
@@ -189,7 +202,7 @@ final class Trigger {
      * 直接走 s0.d() 加窗口，绕开 ContainerActivity.j0() 里那些前置检查。
      * j0 里只要有一步对不上就静默返回，表现就是"点了没反应"。
      */
-    private static boolean addDirect(Object activity, Intent launch) {
+    private static boolean addDirect(Object activity, Intent launch, int userId) {
         try {
             Object view = XposedHelpers.callMethod(activity, ACTIVITY_VIEW.value());
             if (view == null) return false;
@@ -211,7 +224,7 @@ final class Trigger {
                         + " extra=" + launch.getExtras());
                 return false;
             }
-            XposedHelpers.callMethod(taskData, TASK_USER.value(), 0);
+            XposedHelpers.callMethod(taskData, TASK_USER.value(), userId);
             XposedHelpers.callMethod(taskData, TASK_ID.value(),
                     launch.getIntExtra("androidx.activity.LaunchEmbeddedTaskId", -1));
             Object controller = XposedHelpers.callMethod(view, "getContainerController");
@@ -228,14 +241,13 @@ final class Trigger {
      * 刚重排完时会对不上而静默返回。点一次内部退避重试几次，别让用户手点。
      */
     private static void addToCanvas(final android.content.Context context, final String pkg,
-                                    final int attempt) {
+                                    Intent selected, int userId, final int attempt) {
         try {
-            Intent launch = context.getPackageManager().getLaunchIntentForPackage(pkg);
+            Intent launch = launchIntent(context, pkg, selected, userId);
             if (launch == null) {
                 log("no launch intent for " + pkg);
                 return;
             }
-            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
             // 画布已经在跑的时候，Intent 那条路进不了 addFlexibleTask，直接调
             Object activity = currentCanvas();
@@ -246,7 +258,7 @@ final class Trigger {
                     return;
                 }
                 try {
-                    XposedHelpers.callMethod(activity, ADD_TASK.value(), launch, 0, false);
+                    XposedHelpers.callMethod(activity, ADD_TASK.value(), launch, userId, false);
                     int after = canvasCount(activity);
                     log("j0 add " + pkg + " " + before + "->" + after
                             + " try=" + attempt);
@@ -259,7 +271,7 @@ final class Trigger {
                 }
 
                 // j0 里那串前置检查（a2/rectList 对齐）比较脆，直接用 s0.d() 加
-                if (addDirect(activity, launch)) {
+                if (addDirect(activity, launch, userId)) {
                     int now = canvasCount(activity);
                     log("direct add " + pkg + " " + before + "->" + now
                             + " try=" + attempt);
@@ -271,7 +283,7 @@ final class Trigger {
 
                 if (attempt < 3) {
                     new Handler(Looper.getMainLooper()).postDelayed(
-                            () -> addToCanvas(context, pkg, attempt + 1), 400L);
+                            () -> addToCanvas(context, pkg, selected, userId, attempt + 1), 400L);
                     return;
                 }
             }
@@ -283,7 +295,7 @@ final class Trigger {
                     | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             Bundle extra = new Bundle();
             extra.putParcelable("androidx.activity.NewReplacingIntent", launch);
-            extra.putInt("androidx.activity.NewReplacingUserId", 0);
+            extra.putInt("androidx.activity.NewReplacingUserId", userId);
             canvas.putExtras(extra);
             canvas.putExtra("androidx.activity.AddIntentToSplit", true);
             context.startActivity(canvas);
@@ -404,7 +416,7 @@ final class Trigger {
             for (String pkg : packages) {
                 Integer taskId = tasks.get(pkg);
                 if (taskId == null) {
-                    log("no task for " + pkg + ", known=" + tasks.keySet());
+                    log("no task for " + pkg + ", recent task count=" + tasks.size());
                     continue;
                 }
                 try {

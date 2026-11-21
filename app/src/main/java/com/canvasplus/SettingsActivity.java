@@ -2,17 +2,36 @@
 package com.canvasplus;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
 import android.content.res.Configuration;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.ViewGroup;
+import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 
 /** 模块设置页。UI 用代码搭，不依赖资源文件，跟随系统深浅色。 */
 public final class SettingsActivity extends Activity {
 
+    private static final int SAVE_DIAGNOSTICS = 21;
+    private static final DateTimeFormatter LOG_NAME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private Switch noClickZoom;
+    private Button exportLogs;
+    private Button canvasAppInfo;
+    private TextView diagnosticStatus;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -68,7 +87,47 @@ public final class SettingsActivity extends Activity {
         note.setPadding(0, gap / 2, 0, 0);
         root.addView(note);
 
-        setContentView(root);
+        Switch captureLogs = new Switch(this);
+        captureLogs.setText("记录诊断日志");
+        captureLogs.setTextColor(primary);
+        captureLogs.setPadding(0, gap, 0, 0);
+        captureLogs.setChecked(Settings.diagnosticsEnabled(this));
+        captureLogs.setOnClickListener(view -> {
+            boolean enabled = captureLogs.isChecked();
+            if (Settings.setDiagnosticsEnabled(this, enabled)) {
+                refreshDiagnosticStatus();
+            } else {
+                captureLogs.setChecked(!enabled);
+                Toast.makeText(this, "无法保存诊断日志设置", Toast.LENGTH_LONG).show();
+            }
+        });
+        root.addView(captureLogs);
+
+        diagnosticStatus = new TextView(this);
+        diagnosticStatus.setTextSize(13);
+        diagnosticStatus.setTextColor(secondary);
+        diagnosticStatus.setPadding(0, gap, 0, gap / 2);
+        root.addView(diagnosticStatus);
+
+        exportLogs = new Button(this);
+        exportLogs.setText("导出诊断日志");
+        exportLogs.setOnClickListener(view -> chooseLogDestination());
+        root.addView(exportLogs);
+
+        canvasAppInfo = new Button(this);
+        canvasAppInfo.setText("打开系统画布的应用信息");
+        canvasAppInfo.setOnClickListener(view -> openCanvasAppInfo());
+        root.addView(canvasAppInfo);
+
+        Button restart = new Button(this);
+        restart.setText("重启作用域");
+        restart.setOnClickListener(view -> restartScope(restart));
+        root.addView(restart);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(background);
+        scroll.addView(root);
+        setContentView(scroll);
 
         // 状态栏、导航栏跟页面同色，图标明暗跟着夜间模式走
         getWindow().setStatusBarColor(background);
@@ -81,8 +140,111 @@ public final class SettingsActivity extends Activity {
         }
     }
 
+    private void restartScope(Button button) {
+        button.setEnabled(false);
+        new Thread(() -> {
+            String message = ScopeRestart.restart();
+            runOnUiThread(() -> {
+                if (isDestroyed()) return;
+                button.setEnabled(true);
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+            });
+        }, "CanvasPlus-restart-scope").start();
+    }
+
+    private void openCanvasAppInfo() {
+        Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", Settings.CANVAS_PACKAGE, null));
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException error) {
+            Toast.makeText(this, "请在系统设置里找到系统画布，或直接重启手机", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void updateDiagnosticStatus() {
+        var store = new DiagnosticLogStore(getFilesDir().toPath());
+        boolean hasLogs = store.hasLogs();
+        boolean enabled = Settings.diagnosticsEnabled(this);
+        exportLogs.setEnabled(hasLogs);
+        if (!enabled) {
+            diagnosticStatus.setText(hasLogs ? "日志记录已关闭，可导出以前的记录。"
+                    : "日志记录已关闭。开启后复现问题，再导出诊断日志。");
+            canvasAppInfo.setVisibility(android.view.View.GONE);
+            return;
+        }
+        diagnosticStatus.setText(hasLogs
+                ? "已收到模块日志。复现问题后导出，文件可能包含参与分屏的应用包名和异常详情。"
+                : "尚未收到模块日志。更新后请在应用信息里强行停止系统画布，再重新打开分屏。"
+                        + "也可以重启手机，并确认 LSPosed 已为本模块勾选系统画布。");
+        canvasAppInfo.setVisibility(hasLogs ? android.view.View.GONE : android.view.View.VISIBLE);
+    }
+
+    private void chooseLogDestination() {
+        DiagnosticLog.requestPending(this);
+        String name = "CanvasPlus-" + LOG_NAME.format(LocalDateTime.now()) + ".txt";
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE).setType("text/plain")
+                .putExtra(Intent.EXTRA_TITLE, name);
+        try {
+            startActivityForResult(intent, SAVE_DIAGNOSTICS);
+        } catch (ActivityNotFoundException error) {
+            Toast.makeText(this, "找不到系统文件选择器", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent result) {
+        super.onActivityResult(requestCode, resultCode, result);
+        if (requestCode != SAVE_DIAGNOSTICS || resultCode != RESULT_OK
+                || result == null || result.getData() == null) return;
+        var destination = result.getData();
+        exportLogs.setEnabled(false);
+        new Thread(() -> {
+            String status;
+            try {
+                var store = new DiagnosticLogStore(getFilesDir().toPath());
+                byte[] events = store.snapshot();
+                String version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+                String header = "CanvasPlus " + version
+                        + "\nExported: " + Instant.now()
+                        + "\nDevice: " + Build.MANUFACTURER + " " + Build.MODEL
+                        + "\nAndroid: " + Build.VERSION.RELEASE + " (SDK " + Build.VERSION.SDK_INT + ")"
+                        + "\nBuild: " + Build.DISPLAY + "\n\n";
+                try (OutputStream output = getContentResolver().openOutputStream(destination, "wt")) {
+                    if (output == null) throw new IOException("Document could not be opened");
+                    output.write(header.getBytes(StandardCharsets.UTF_8));
+                    output.write(events.length == 0
+                            ? "尚未收到模块日志。请确认 LSPosed 已勾选系统画布，重启画布后再次复现并导出。\n"
+                                    .getBytes(StandardCharsets.UTF_8)
+                            : events);
+                }
+                status = events.length == 0 ? "已保存设备信息，尚未收到模块日志" : "诊断日志已保存";
+            } catch (IOException | android.content.pm.PackageManager.NameNotFoundException
+                     | RuntimeException error) {
+                android.util.Log.w("CanvasPlus", "Diagnostic export failed", error);
+                status = "导出失败，请重新选择保存位置";
+            }
+            String message = status;
+            runOnUiThread(() -> {
+                if (isDestroyed()) return;
+                exportLogs.setEnabled(true);
+                updateDiagnosticStatus();
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+            });
+        }, "CanvasPlus-export").start();
+    }
+
     @Override protected void onResume() {
         super.onResume();
         if (noClickZoom != null) noClickZoom.setChecked(Settings.get(this));
+        refreshDiagnosticStatus();
+    }
+
+    private void refreshDiagnosticStatus() {
+        updateDiagnosticStatus();
+        DiagnosticLog.requestPending(this);
+        diagnosticStatus.postDelayed(() -> {
+            if (!isDestroyed()) updateDiagnosticStatus();
+        }, 1200);
     }
 }
