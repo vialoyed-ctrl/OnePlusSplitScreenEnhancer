@@ -16,6 +16,22 @@ final class ScopeRestart {
 
     private ScopeRestart() {}
 
+    static boolean hasRoot() {
+        Process process = null;
+        try {
+            process = new ProcessBuilder("su", "-c", "[ \"$(id -u)\" = 0 ]")
+                    .redirectErrorStream(true).start();
+            return process.waitFor(45, TimeUnit.SECONDS) && process.exitValue() == 0;
+        } catch (IOException | SecurityException error) {
+            return false;
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return false;
+        } finally {
+            if (process != null && process.isAlive()) process.destroyForcibly();
+        }
+    }
+
     static String restart() {
         Process process = null;
         try {

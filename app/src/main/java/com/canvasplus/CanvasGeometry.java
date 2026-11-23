@@ -143,10 +143,6 @@ final class CanvasGeometry {
         return true;
     }
 
-    static List<Rect> landscapeRow(int width, int height, int gap, int count, float leftShare) {
-        return landscapeRow(width, height, gap, count, leftShare, null);
-    }
-
     static List<Rect> landscapeRow(int width, int height, int gap, int count, float leftShare,
                                    float[] dividers) {
         List<Rect> panes = new ArrayList<>(count);
@@ -180,17 +176,22 @@ final class CanvasGeometry {
         int leftRows = count == 4 || mode == 7 ? 2 : 1;
         int rightRows = count == 4 || mode == 6 ? 2 : 1;
         float aspect = (float) phone.height() / phone.width();
-        int maxLeftWidth = (int) (((height - (leftRows - 1) * gap) / leftRows) / aspect);
-        int maxRightWidth = (int) (((height - (rightRows - 1) * gap) / rightRows) / aspect);
-        int columnsWidth = Math.min(width - gap, (int) Math.min(
-                maxLeftWidth / leftShare, maxRightWidth / (1f - leftShare)));
-        if (count == 4) columnsWidth -= columnsWidth % 2;
+        int maxLeftHeight = (height - (leftRows - 1) * gap) / leftRows;
+        int maxRightHeight = (height - (rightRows - 1) * gap) / rightRows;
+        int columnsWidth = width - gap;
+        if (count == 4) {
+            int maxLeftWidth = (int) (maxLeftHeight / aspect);
+            int maxRightWidth = (int) (maxRightHeight / aspect);
+            columnsWidth = Math.min(columnsWidth, (int) Math.min(
+                    maxLeftWidth / leftShare, maxRightWidth / (1f - leftShare)));
+            columnsWidth -= columnsWidth % 2;
+        }
         int leftWidth = Math.round(columnsWidth * leftShare);
         int rightWidth = columnsWidth - leftWidth;
         if (leftWidth <= 0 || rightWidth <= 0) return panes;
 
-        int leftPaneHeight = Math.round(leftWidth * aspect);
-        int rightPaneHeight = Math.round(rightWidth * aspect);
+        int leftPaneHeight = Math.min(maxLeftHeight, Math.round(leftWidth * aspect));
+        int rightPaneHeight = Math.min(maxRightHeight, Math.round(rightWidth * aspect));
         int leftTop = (height - leftRows * leftPaneHeight - (leftRows - 1) * gap) / 2;
         int rightTop = (height - rightRows * rightPaneHeight - (rightRows - 1) * gap) / 2;
 

@@ -35,6 +35,26 @@ public final class SettingsActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        TextView checking = new TextView(this);
+        checking.setGravity(android.view.Gravity.CENTER);
+        checking.setText("正在检查 Root 权限…");
+        setContentView(checking);
+        new Thread(() -> {
+            boolean granted = ScopeRestart.hasRoot();
+            runOnUiThread(() -> {
+                if (isDestroyed() || isFinishing()) return;
+                if (granted) {
+                    showSettings();
+                    refreshDiagnosticStatus();
+                } else {
+                    Toast.makeText(this, "未获得 Root 权限，已关闭一加分屏增强", Toast.LENGTH_LONG).show();
+                    finishAndRemoveTask();
+                }
+            });
+        }, "CanvasPlus-check-root").start();
+    }
+
+    private void showSettings() {
         CharSequence appName = getApplicationInfo().loadLabel(getPackageManager());
         setTitle(appName);
 
@@ -236,6 +256,7 @@ public final class SettingsActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        if (diagnosticStatus == null) return;
         if (noClickZoom != null) noClickZoom.setChecked(Settings.get(this));
         refreshDiagnosticStatus();
     }

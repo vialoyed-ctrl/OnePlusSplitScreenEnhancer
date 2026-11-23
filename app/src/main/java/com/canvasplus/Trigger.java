@@ -39,7 +39,6 @@ final class Trigger {
     private static final String ACTION_LAYOUT = "com.canvasplus.LAYOUT";
     private static final String EXTRA_PACKAGES = "packages";
     private static final String MANAGER = "com.oplus.flexiblewindow.FlexibleWindowManager";
-    private static final String SERVICE = "com.android.server.wm.FlexibleWindowManagerService";
 
     private Trigger() {}
 
@@ -124,9 +123,25 @@ final class Trigger {
                         boolean room = count >= 0 && count < 4;
                         log("add request " + pkg + " user=" + userId + " visible=" + visible + " count=" + count);
                         if (CanvasApi.isColorOs17()) {
-                            boolean accepted = visible && room && count >= 2
-                                    && addOnColorOs17(context, activity, pkg, launch, userId, count);
-                            if (isOrderedBroadcast()) setResultCode(accepted ? 1 : 0);
+                            boolean ordered = isOrderedBroadcast();
+                            if (!visible || !room || count < 2) {
+                                if (ordered) setResultCode(0);
+                                return;
+                            }
+                            android.view.View canvas = (android.view.View) XposedHelpers.callMethod(
+                                    activity, ACTIVITY_VIEW.value());
+                            PendingResult result = goAsync();
+                            java.util.function.Consumer<Boolean> add = ready -> {
+                                try {
+                                    int total = ready && isForeground(activity) ? canvasCount(activity) : -1;
+                                    boolean accepted = total >= 2 && total < 4
+                                            && addOnColorOs17(context, activity, pkg, launch, userId, total);
+                                    if (ordered) result.setResultCode(accepted ? 1 : 0);
+                                } finally {
+                                    result.finish();
+                                }
+                            };
+                            if (!CanvasLayout.deferWindowCountChange(canvas, add)) add.accept(true);
                             return;
                         }
                         if (intent.getBooleanExtra("ordered", false)) {
@@ -210,14 +225,11 @@ final class Trigger {
             if (adapter == null) return false;
             // s0 内部会把 context 强转成 ContainerActivity，必须传 Activity 本身
             Class<?> util = XposedHelpers.findClass(UTIL.value(), activity.getClass().getClassLoader());
-            Object taskData = XposedHelpers.callStaticMethod(
-                    util, CREATE_TASK.value(), activity, launch, -2, -1);
+            Object taskData = CanvasApi.createTask(util, activity, launch);
             if (taskData == null) {
                 Object bounds = null;
                 try {
-                    bounds = CanvasApi.isColorOs17()
-                            ? XposedHelpers.callStaticMethod(util, "o", launch, -2, 0)
-                            : XposedHelpers.callStaticMethod(util, "o", activity, launch, -2, 0);
+                    bounds = CanvasApi.launchBounds(util, activity, launch);
                 } catch (Throwable ignored) {
                 }
                 log("add direct: taskData null bounds=" + bounds

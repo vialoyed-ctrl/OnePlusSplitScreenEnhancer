@@ -2,10 +2,11 @@
 <!-- 一加分屏增强修改了 CanvasPlus 的应用清单。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.canvasplus"
-    android:versionCode="45"
-    android:versionName="0.2.43">
+    android:versionCode="81"
+    android:versionName="0.2.79">
 
     <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="36" />
+
 
     <application
         android:hasCode="true"
