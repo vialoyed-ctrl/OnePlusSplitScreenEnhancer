@@ -122,7 +122,7 @@ final class Trigger {
                         boolean visible = isForeground(activity);
                         boolean room = count >= 0 && count < 4;
                         log("add request " + pkg + " user=" + userId + " visible=" + visible + " count=" + count);
-                        if (CanvasApi.isColorOs17()) {
+                        if (CanvasApi.usesScreenSizedOverview()) {
                             boolean ordered = isOrderedBroadcast();
                             if (!visible || !room || count < 2) {
                                 if (ordered) setResultCode(0);
@@ -135,7 +135,7 @@ final class Trigger {
                                 try {
                                     int total = ready && isForeground(activity) ? canvasCount(activity) : -1;
                                     boolean accepted = total >= 2 && total < 4
-                                            && addOnColorOs17(context, activity, pkg, launch, userId, total);
+                                            && addToActiveCanvas(context, activity, pkg, launch, userId, total);
                                     if (ordered) result.setResultCode(accepted ? 1 : 0);
                                 } finally {
                                     result.finish();
@@ -154,7 +154,7 @@ final class Trigger {
                     String[] packages = intent.getStringArrayExtra(EXTRA_PACKAGES);
                     if (packages == null || packages.length == 0) return;
                     CanvasLayout.forcedMode = intent.getIntExtra("mode", 0);
-                    if (CanvasApi.isColorOs17()) {
+                    if (CanvasApi.usesScreenSizedOverview()) {
                         CanvasLayout.forcedOrientation = CanvasLayout.forcedMode >= 3
                                 && CanvasLayout.forcedMode <= 7 ? CanvasLayout.forcedMode
                                 : CanvasLayout.savedThreePaneMode(context);
@@ -178,7 +178,7 @@ final class Trigger {
 
     /** 给画布发 AddIntentToSplit，让它自己走 addFlexibleTask 添加窗口。 */
     /** 侧边栏点应用时，只有一个问题：现在该加进画布，还是照旧开小窗。 */
-    private static boolean addOnColorOs17(Context context, Object activity, String pkg, Intent selected,
+    private static boolean addToActiveCanvas(Context context, Object activity, String pkg, Intent selected,
                                           int userId, int before) {
         Intent launch = launchIntent(context, pkg, selected, userId);
         if (launch == null) return false;
@@ -240,7 +240,7 @@ final class Trigger {
             XposedHelpers.callMethod(taskData, TASK_ID.value(),
                     launch.getIntExtra("androidx.activity.LaunchEmbeddedTaskId", -1));
             Object controller = XposedHelpers.callMethod(view, "getContainerController");
-            XposedHelpers.callMethod(controller, "d", taskData);
+            XposedHelpers.callMethod(controller, CONTROLLER_ADD.value(), taskData);
             return true;
         } catch (Throwable error) {
             log("add direct failed: " + error);
