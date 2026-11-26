@@ -14,7 +14,9 @@ final class CanvasApi {
     static final String ACTIVITY = PACKAGE + "ContainerActivity";
     static final String VIEW = PACKAGE + "view.ContainerView";
 
-    private enum Profile { LEGACY, UPDATED_COLOR_OS_16, REVISED_COLOR_OS_16, COLOR_OS_17, UPDATED_COLOR_OS_17 }
+    private enum Profile {
+        LEGACY, UPDATED_COLOR_OS_16, REVISED_COLOR_OS_16, ALTERNATE_COLOR_OS_16, COLOR_OS_17, UPDATED_COLOR_OS_17
+    }
 
     private static Profile profile = Profile.LEGACY;
     private static boolean updatedColorOs16Overview;
@@ -22,67 +24,68 @@ final class CanvasApi {
     enum Member {
         ADAPTER("u1.c", "c2.c", "c2.c", "u1.c", "p1.c"),
         TASK("u1.d", "c2.d", "c2.d", "u1.d", "p1.d"),
-        CONTROLLER(PACKAGE + "s0", PACKAGE + "v0", PACKAGE + "w0", PACKAGE + "r0", PACKAGE + "p0"),
+        CONTROLLER(PACKAGE + "s0", PACKAGE + "v0", PACKAGE + "w0", PACKAGE + "r0", PACKAGE + "p0", PACKAGE + "l0"),
         POLICY_SELECTOR("B1.n", "i2.m", "i2.m", "B1.n", "w1.n"),
-        TABLET_POLICY("B1.r", "i2.r", "i2.r", "B1.r", "w1.r"),
+        TABLET_POLICY("B1.r", "i2.r", "i2.r", "B1.r", "w1.r", "w1.s"),
         UTIL("B1.l", PACKAGE + "util.FlexibleWindowUtil", PACKAGE + "util.FlexibleWindowUtil", "B1.l", "w1.l"),
         UI_MANAGER("A1.b", "h2.b", "h2.b", "A1.b", "v1.b"),
-        SPLIT_BAR(PACKAGE + "E", PACKAGE + "G", PACKAGE + "G", PACKAGE + "E", PACKAGE + "C"),
-        SPLIT_BAR_ITEM(PACKAGE + "E$c", PACKAGE + "G$c", PACKAGE + "G$c", PACKAGE + "E$c", PACKAGE + "C$c"),
-        TO_FLOATING(PACKAGE + "I", PACKAGE + "K", PACKAGE + "L", PACKAGE + "I", PACKAGE + "G"),
+        SPLIT_BAR(PACKAGE + "E", PACKAGE + "G", PACKAGE + "G", PACKAGE + "E", PACKAGE + "C", PACKAGE + "z"),
+        SPLIT_BAR_ITEM(PACKAGE + "E$c", PACKAGE + "G$c", PACKAGE + "G$c", PACKAGE + "E$c", PACKAGE + "C$c", PACKAGE + "z$c"),
+        TO_FLOATING(PACKAGE + "I", PACKAGE + "K", PACKAGE + "L", PACKAGE + "I", PACKAGE + "G", PACKAGE + "D"),
         FLOATING_ANIMATOR("$j", "$j", "$k"),
 
-        ACTIVITY_VIEW("x0", "G0", "H0", "v0"),
+        ACTIVITY_VIEW("x0", "G0", "H0", "v0", "v0", "s0"),
         ACTIVITY_MASK_OFFSET("T0", "T0", "U0"),
-        ACTIVITY_FOCUS_TASK_ID("E0", "E0", "F0", "u0", "u0"),
-        ACTIVITY_FROM_CONTEXT("O1", "X1", "b2", "O1", "u1"),
-        ADD_TASK("j0", "p0", "p0", "h0"),
+        ACTIVITY_FOCUS_TASK_ID("E0", "E0", "F0", "u0", "u0", "r0"),
+        ACTIVITY_FROM_CONTEXT("O1", "X1", "b2", "O1", "u1", "o1"),
+        ADD_TASK("j0", "p0", "p0", "h0", "h0", "e0"),
         CREATE_TASK("n0", "s0", "t0", "n0", "h0"),
         TASK_USER("s0", "u0", "u0", "r0", "d0"),
         TASK_ID("l0", "n0", "n0", "k0", "Y"),
         TASK_ID_GETTER("t", "t", "t", "s", "q"),
         TASK_ENLARGED("p0", "r0", "r0", "p0", "J"),
-        THREE_LAYOUT("M1", "V1", "Z1", "M1", "s1"),
-        LAYOUT("N2", "W2", "W2", "N2", "J2"),
-        LAYOUT_TWO("O2", "X2", "X2", "O2", "K2"),
+        THREE_LAYOUT("M1", "V1", "Z1", "M1", "s1", "m1"),
+        LAYOUT("N2", "W2", "W2", "N2", "J2", "t2"),
+        LAYOUT_TWO("O2", "X2", "X2", "O2", "K2", "u2"),
         TASK_CONTENT_USER("w", "w", "w", "v", "s"),
         TASK_BOUNDS("o", "o", "o", "o", "m"),
         CONTROLLER_ADD("d", "d", "d", "d", "b"),
         ADAPTER_FOCUS("I", "I", "I", "H"),
-        DECOR_CORNER_RADIUS("k0", "k0", "k0", "j0", "c0"),
+        DECOR_CORNER_RADIUS("k0", "k0", "k0", "j0", "c0", "a0"),
         GESTURES(PACKAGE + "A", PACKAGE + "A", PACKAGE + "A", PACKAGE + "y", PACKAGE + "w"),
         GESTURE_CANVAS("h", "h", "h", "g"),
-        CLAIM_INPUT("O1", "O1", "O1", "w1", "v1"),
+        CLAIM_INPUT("O1", "O1", "O1", "w1", "v1", "q1"),
         WINDOW_HEADER(PACKAGE + "v", PACKAGE + "v", PACKAGE + "v", PACKAGE + "t", PACKAGE + "r"),
         WINDOW_MENU_BUILDER("com.coui.appcompat.poplist.L$a", "com.coui.appcompat.poplist.L$a",
                 "com.coui.appcompat.poplist.L$a", "com.coui.appcompat.poplist.s$a"),
-        LAYOUT_CHILDREN("w1", "D1", "D1", "w1", "v1"),
-        THREE_WINDOWS("i1", "o1", "o1", "i1", "h1"),
-        EMBEDDED_VIEW("q0", "v0"),
-        PREPARE_VIEWS("T2", "V2", "V2", "T2", "P2"),
-        FOCUS_SCALE("T", "X"),
-        ANIMATE_SCALE("A2", "J2", "J2", "A2", "w2"),
+        LAYOUT_CHILDREN("w1", "D1", "D1", "w1", "v1", "k1"),
+        THREE_WINDOWS("i1", "o1", "o1", "i1", "h1", "W0"),
+        EMBEDDED_VIEW("q0", "v0", "v0", "q0", "q0", "m0"),
+        PREPARE_VIEWS("T2", "V2", "V2", "T2", "P2", "z2"),
+        FOCUS_SCALE("T", "X", "X", "T", "T", "P"),
+        ANIMATE_SCALE("A2", "J2", "J2", "A2", "w2", "h2"),
         SCALE_TARGET("a0", "d0"),
-        CLOSE_TASK("T1", "a2", "a2", "T1", "Q1"),
-        REMOVE_TASK("X1", "e2", "e2", "X1", "U1"),
-        TASK_TO_FULLSCREEN("l0", "q0", "q0", "m0"),
-        RECT_CHANGED("x1", "N1", "N1", "v1", "u1"),
-        IME_HEIGHT("o1", "E1", "E1", "m1", "l1"),
-        EXCHANGE_TASKS("k0", "o0"),
-        BAR_DRAG("r0", "s0", "s0", "q0"),
-        BAR_SCROLL("q0", "r0", "r0", "p0"),
-        FLOATING_CAN_ANIMATE("n0", "l0", "r0", "j0", "i0"),
-        FLOATING_START_RECTS("i0", "g0", "m0", "i0", "h0"),
-        FLOATING_SOURCE_RECT("h0", "f0", "l0", "h0", "g0"),
-        FLOATING_ANIMATION("k0", "i0", "o0", "k0", "j0"),
+        CLOSE_TASK("T1", "a2", "a2", "T1", "Q1", "F1"),
+        REMOVE_TASK("X1", "e2", "e2", "X1", "U1", "J1"),
+        TASK_TO_FULLSCREEN("l0", "q0", "q0", "m0", "m0", "i0"),
+        RECT_CHANGED("x1", "N1", "N1", "v1", "u1", "p1"),
+        IME_HEIGHT("o1", "E1", "E1", "m1", "l1", "g1"),
+        EXCHANGE_TASKS("k0", "o0", "o0", "k0", "k0", "g0"),
+        BAR_DRAG("r0", "s0", "s0", "q0", "q0", "X"),
+        BAR_SCROLL("q0", "r0", "r0", "p0", "p0", "W"),
+        FLOATING_CAN_ANIMATE("n0", "l0", "r0", "j0", "i0", "h0"),
+        FLOATING_START_RECTS("i0", "g0", "m0", "i0", "h0", "g0"),
+        FLOATING_SOURCE_RECT("h0", "f0", "l0", "h0", "g0", "f0"),
+        FLOATING_ANIMATION("k0", "i0", "o0", "k0", "j0", "i0"),
         REFRESH_TASK_DATA("e3", "n3"),
-        CALCULATE_RECTS("c1", "j1", "m1", "c1", "P0");
+        CALCULATE_RECTS("c1", "j1", "m1", "c1", "P0", "L0");
 
         private final String legacy;
         private final String current;
         private final String updated;
         private final String updatedColorOs16;
         private final String revisedColorOs16;
+        private final String alternateColorOs16;
 
         Member(String legacy, String current) {
             this(legacy, current, current);
@@ -97,11 +100,17 @@ final class CanvasApi {
         }
 
         Member(String legacy, String current, String updated, String updatedColorOs16, String revisedColorOs16) {
+            this(legacy, current, updated, updatedColorOs16, revisedColorOs16, revisedColorOs16);
+        }
+
+        Member(String legacy, String current, String updated, String updatedColorOs16, String revisedColorOs16,
+               String alternateColorOs16) {
             this.legacy = legacy;
             this.current = current;
             this.updated = updated;
             this.updatedColorOs16 = updatedColorOs16;
             this.revisedColorOs16 = revisedColorOs16;
+            this.alternateColorOs16 = alternateColorOs16;
         }
 
         String value() {
@@ -113,6 +122,7 @@ final class CanvasApi {
                 case LEGACY -> legacy;
                 case UPDATED_COLOR_OS_16 -> updatedColorOs16;
                 case REVISED_COLOR_OS_16 -> revisedColorOs16;
+                case ALTERNATE_COLOR_OS_16 -> alternateColorOs16;
                 case COLOR_OS_17 -> current;
                 case UPDATED_COLOR_OS_17 -> updated;
             };
@@ -123,9 +133,9 @@ final class CanvasApi {
 
     static boolean select(ClassLoader loader) {
         for (Profile candidate : new Profile[]{Profile.COLOR_OS_17, Profile.UPDATED_COLOR_OS_17,
-                Profile.UPDATED_COLOR_OS_16, Profile.REVISED_COLOR_OS_16, Profile.LEGACY}) {
+                Profile.UPDATED_COLOR_OS_16, Profile.REVISED_COLOR_OS_16, Profile.ALTERNATE_COLOR_OS_16, Profile.LEGACY}) {
             boolean colorOs16Update = candidate == Profile.UPDATED_COLOR_OS_16
-                    || candidate == Profile.REVISED_COLOR_OS_16;
+                    || candidate == Profile.REVISED_COLOR_OS_16 || candidate == Profile.ALTERNATE_COLOR_OS_16;
             if (matches(loader, candidate)
                     && (!colorOs16Update || matchesUpdatedColorOs16(loader, candidate))) {
                 profile = candidate;
@@ -165,15 +175,19 @@ final class CanvasApi {
     }
 
     static boolean hasColorOs16CanvasUpdate() {
-        return profile == Profile.UPDATED_COLOR_OS_16 || profile == Profile.REVISED_COLOR_OS_16;
+        return profile == Profile.UPDATED_COLOR_OS_16 || isRevisedColorOs16();
     }
 
     static boolean isRevisedColorOs16() {
-        return profile == Profile.REVISED_COLOR_OS_16;
+        return profile == Profile.REVISED_COLOR_OS_16 || profile == Profile.ALTERNATE_COLOR_OS_16;
     }
 
     static String colorOs16Revision(String original, String revised) {
         return isRevisedColorOs16() ? revised : original;
+    }
+
+    static String colorOs16Revision(String original, String revised, String alternate) {
+        return profile == Profile.ALTERNATE_COLOR_OS_16 ? alternate : colorOs16Revision(original, revised);
     }
 
     static boolean usesScreenSizedOverview() {
@@ -188,9 +202,9 @@ final class CanvasApi {
             view.getDeclaredMethod(Member.LAYOUT_TWO.value());
             view.getDeclaredMethod(Member.TASK_TO_FULLSCREEN.value(), int.class);
             gestures.getDeclaredMethod("T", android.view.MotionEvent.class);
-            header.getDeclaredMethod(colorOs16Revision("N0", "G0"));
+            header.getDeclaredMethod(colorOs16Revision("N0", "G0", "E0"));
             Class.forName(colorOs16Revision("y1.n", "t1.n"), false, loader)
-                    .getDeclaredMethod(colorOs16Revision("e0", "c0"), view);
+                    .getDeclaredMethod(colorOs16Revision("e0", "c0", "b0"), view);
             return true;
         } catch (ReflectiveOperationException | LinkageError unavailable) {
             ModuleEntry.log("updated ColorOS 16 overview unavailable: " + unavailable);

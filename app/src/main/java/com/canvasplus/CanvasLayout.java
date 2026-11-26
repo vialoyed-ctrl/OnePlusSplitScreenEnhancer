@@ -310,7 +310,13 @@ final class CanvasLayout {
         try {
             Class<?> replacer = XposedHelpers.findClass(
                     "com.oplus.pscanvas.canvasmode.canvas.c", loader);
-            XposedBridge.hookAllMethods(replacer, "m", new XC_MethodHook() {
+            // The alternate ColorOS 16 canvas renamed the native zoom dispatcher
+            // from m() to l().  Hooking the dispatcher is essential here: its
+            // stock implementation promotes the selected embedded task to a
+            // standalone full-screen window.
+            XposedBridge.hookAllMethods(replacer,
+                    CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("m", "m", "l") : "m",
+                    new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
                         Object container = param.args[0];
@@ -820,7 +826,7 @@ final class CanvasLayout {
             Class<?> view = XposedHelpers.findClass(CanvasApi.VIEW, loader);
             Class<?> maskList = XposedHelpers.findClass(MASK_LIST_VIEW, loader);
             XposedHelpers.findAndHookMethod(maskManagerClass(), loader,
-                    CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("e0", "c0") : "f0", view, new XC_MethodHook() {
+                    CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("e0", "c0", "b0") : "f0", view, new XC_MethodHook() {
                         @Override protected void afterHookedMethod(MethodHookParam param) {
                             View canvas = (View) param.args[0];
                             Object list = XposedHelpers.getObjectField(param.thisObject, "d");
@@ -832,7 +838,7 @@ final class CanvasLayout {
                             XposedHelpers.setAdditionalInstanceField(masks, TRANSITION_MASK, mask);
                         }
                     });
-            XposedHelpers.findAndHookMethod(maskList, CanvasApi.hasColorOs16CanvasUpdate() ? "m" : "n",
+            XposedHelpers.findAndHookMethod(maskList, CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("m", "m", "k") : "n",
                     new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     if (XposedHelpers.getAdditionalInstanceField(param.thisObject, TRANSITION_MASK)
@@ -881,12 +887,12 @@ final class CanvasLayout {
             boolean colorOs16 = CanvasApi.hasColorOs16CanvasUpdate();
             Class<?> manager = XposedHelpers.findClass(maskManagerClass(), loader);
             Class<?> maskList = XposedHelpers.findClass(MASK_LIST_VIEW, loader);
-            var removeWindow = XposedHelpers.findMethodExact(view, colorOs16 ? colorOs16Revision("W1", "T1") : "d2", int.class);
-            var windowMotion = XposedHelpers.findMethodExact(view, colorOs16 ? colorOs16Revision("A1", "z1") : "H1", int.class, List.class, List.class);
+            var removeWindow = XposedHelpers.findMethodExact(view, colorOs16 ? colorOs16Revision("W1", "T1", "I1") : "d2", int.class);
+            var windowMotion = XposedHelpers.findMethodExact(view, colorOs16 ? colorOs16Revision("A1", "z1", "o1") : "H1", int.class, List.class, List.class);
             var maskMotion = XposedHelpers.findMethodExact(manager, colorOs16Revision("w", "v"), boolean.class, Rect.class,
                     Rect.class, int.class, List.class, int.class);
             var hideMasks = CanvasApi.isRevisedColorOs16()
-                    ? XposedHelpers.findMethodExact(maskList, "p", long.class, long.class,
+                    ? XposedHelpers.findMethodExact(maskList, colorOs16Revision("p", "p", "n"), long.class, long.class,
                             boolean.class, Animator.AnimatorListener.class, int.class)
                     : XposedHelpers.findMethodExact(maskList, colorOs16 ? "q" : "r", long.class, long.class,
                             boolean.class, Animator.AnimatorListener.class, int.class, long.class);
@@ -1979,10 +1985,10 @@ final class CanvasLayout {
         dividerPopupAnchor.set(edge);
         try {
             boolean colorOs16 = CanvasApi.hasColorOs16CanvasUpdate();
-            Object handle = XposedHelpers.callMethod(bar, colorOs16 ? "W" : "X", event);
+            Object handle = XposedHelpers.callMethod(bar, colorOs16 ? colorOs16Revision("W", "W", "O") : "X", event);
             if (handle != null) {
                 nativeDividerPairs.put(handle, pair);
-                XposedHelpers.callMethod(bar, colorOs16 ? "o0" : "q0", handle);
+                XposedHelpers.callMethod(bar, colorOs16 ? colorOs16Revision("o0", "o0", "V") : "q0", handle);
                 Object menu = XposedHelpers.getObjectField(bar, "j");
                 if (menu instanceof android.widget.PopupWindow popup && popup.isShowing()) return;
                 nativeDividerPairs.remove(handle);
@@ -1997,7 +2003,7 @@ final class CanvasLayout {
 
     private static void showDividerPopup(View canvas, Object adapter, Object bar, PaneEdge edge, int[] pair) {
         boolean colorOs16 = CanvasApi.hasColorOs16CanvasUpdate();
-        XposedHelpers.callMethod(bar, colorOs16 ? "S" : "T");
+        XposedHelpers.callMethod(bar, colorOs16 ? colorOs16Revision("S", "S", "K") : "T");
         android.widget.PopupWindow popup = (android.widget.PopupWindow) XposedHelpers.getObjectField(bar, "j");
         Class<?> builder = XposedHelpers.findClass(WINDOW_MENU_BUILDER.value(), bar.getClass().getClassLoader());
         List<Object> items = new ArrayList<>();
@@ -2009,7 +2015,7 @@ final class CanvasLayout {
             if (!canvas.isAttachedToWindow() || layoutLocked(canvas.getContext())
                     || CanvasApi.adapter(canvas) != adapter) return;
             if (row == 0) swapDividerPanes(canvas, adapter, pair);
-            else if (row == 1) XposedHelpers.callMethod(canvas, colorOs16 ? colorOs16Revision("K1", "I1") : "R1");
+            else if (row == 1) XposedHelpers.callMethod(canvas, colorOs16 ? colorOs16Revision("K1", "I1", "x1") : "R1");
         };
         XposedHelpers.callMethod(popup, colorOs16 ? "p0" : "e1", select);
         XposedHelpers.callMethod(popup, colorOs16 ? "o0" : "d1", true, true);
@@ -2105,9 +2111,14 @@ final class CanvasLayout {
             Class<?> header = XposedHelpers.findClass(WINDOW_HEADER.value(), loader);
             Class<?> builder = XposedHelpers.findClass(WINDOW_MENU_BUILDER.value(), loader);
             Class<?> strings = XposedHelpers.findClass(colorOs16 ? colorOs16Revision("t1.j", "o1.j") : "com.oplus.pscanvas.j", loader);
-            int enlargeText = XposedHelpers.getStaticIntField(strings, colorOs16Revision("W", "V"));
-            int shrinkText = XposedHelpers.getStaticIntField(strings, colorOs16Revision("X", "W"));
-            XposedHelpers.findAndHookMethod(header, colorOs16 ? colorOs16Revision("N0", "G0") : "U0", new XC_MethodHook() {
+            // The alternate ColorOS 16 canvas moved these two labels to P/Q.
+            // Keeping the native zoom entries makes a four-pane menu select the
+            // system "enlarge" action instead of CanvasPlus' pane-preserving one.
+            int enlargeText = XposedHelpers.getStaticIntField(strings,
+                    colorOs16Revision("W", "V", "P"));
+            int shrinkText = XposedHelpers.getStaticIntField(strings,
+                    colorOs16Revision("X", "W", "Q"));
+            XposedHelpers.findAndHookMethod(header, colorOs16 ? colorOs16Revision("N0", "G0", "E0") : "U0", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     Object owner = param.thisObject;
                     View canvas = (View) XposedHelpers.getObjectField(owner, canvasField);
@@ -2597,7 +2608,7 @@ final class CanvasLayout {
             XposedBridge.hookAllConstructors(view, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     // The canvas uses this field for task surface creation and layer updates.
-                    XposedHelpers.setIntField(param.thisObject, colorOs16Revision("t", "o"), 0);
+                    XposedHelpers.setIntField(param.thisObject, colorOs16Revision("t", "o", "m"), 0);
                 }
             });
             Class<?> decor = XposedHelpers.findClass(CanvasApi.PACKAGE + "view.EmbeddedViewDecor", loader);
@@ -2644,7 +2655,7 @@ final class CanvasLayout {
             contentScaleDialogs = new java.util.WeakHashMap<>();
 
     private static boolean isPaneMenuShowing(View canvas) {
-        Object popup = XposedHelpers.getObjectField(canvas, CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("V", "Q") : "W");
+        Object popup = XposedHelpers.getObjectField(canvas, CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("V", "Q", "N") : "W");
         if (popup instanceof android.widget.PopupWindow menu && menu.isShowing()) return true;
         var reference = contentScaleDialogs.get(canvas);
         android.app.Dialog dialog = reference == null ? null : reference.get();
@@ -2685,7 +2696,7 @@ final class CanvasLayout {
                     Object adapter = CanvasApi.adapter(canvas);
                     if (adapter == null || CanvasGeometry.mainPane(count(adapter), mainPaneMode(canvas, adapter)) < 0
                             || !autoMainWindow(canvas.getContext()) || isFourZoomed(canvas)
-                            || XposedHelpers.getBooleanField(canvas, colorOs16 ? colorOs16Revision("S", "N") : "T")) return;
+                            || XposedHelpers.getBooleanField(canvas, colorOs16 ? colorOs16Revision("S", "N", "K") : "T")) return;
                     String indexField = colorOs16 ? "n" : "o";
                     int index = XposedHelpers.getIntField(param.thisObject, indexField);
                     if (index < 0 || index >= count(adapter) || index == mainPane(canvas, adapter)) return;
@@ -2694,7 +2705,7 @@ final class CanvasLayout {
                     for (PaneEdge edge : resizeEdges(canvas)) {
                         if (edge.hit().contains(x, y)) return;
                     }
-                    int hit = (Integer) XposedHelpers.callMethod(canvas, colorOs16 ? "g0" : "k0",
+                    int hit = (Integer) XposedHelpers.callMethod(canvas, colorOs16 ? colorOs16Revision("g0", "g0", "c0") : "k0",
                             x, y);
                     if (index != hit) return;
                     Object decor = XposedHelpers.callMethod(canvas, EMBEDDED_VIEW.value(), index);
@@ -2756,7 +2767,7 @@ final class CanvasLayout {
                     if (mainPaneAnimations.remove(canvas, animation) && canvas.isAttachedToWindow()) {
                         if (CanvasApi.hasColorOs16CanvasUpdate()) {
                             // Sync the embedded task frames after the transforms settle.
-                            XposedHelpers.callMethod(canvas, colorOs16Revision("s2", "p2"));
+                            XposedHelpers.callMethod(canvas, colorOs16Revision("s2", "p2", "a2"));
                         } else {
                             XposedHelpers.callMethod(canvas, "z2");
                             XposedHelpers.callMethod(canvas, "v2");
@@ -3145,9 +3156,9 @@ final class CanvasLayout {
         if (parent.getScaleY() != scale) parent.setScaleY(scale);
         if (CanvasApi.hasColorOs16CanvasUpdate()) {
             layoutTy.put(canvas, y);
-            XposedHelpers.setFloatField(canvas, colorOs16Revision("z0", "u0"), x);
-            XposedHelpers.setFloatField(canvas, colorOs16Revision("A0", "v0"), parent.getTranslationY());
-            XposedHelpers.setFloatField(canvas, colorOs16Revision("B0", "w0"), scale);
+            XposedHelpers.setFloatField(canvas, colorOs16Revision("z0", "u0", "q0"), x);
+            XposedHelpers.setFloatField(canvas, colorOs16Revision("A0", "v0", "r0"), parent.getTranslationY());
+            XposedHelpers.setFloatField(canvas, colorOs16Revision("B0", "w0", "s0"), scale);
         } else {
             XposedHelpers.setFloatField(canvas, "A0", x);
             XposedHelpers.setFloatField(canvas, "B0", parent.getTranslationY());
@@ -3158,9 +3169,9 @@ final class CanvasLayout {
 
     private static void setAutoTarget(View canvas, float x, float y, float scale) {
         boolean colorOs16 = CanvasApi.hasColorOs16CanvasUpdate();
-        XposedHelpers.setFloatField(canvas, colorOs16 ? colorOs16Revision("n0", "i0") : "o0", x);
-        XposedHelpers.setFloatField(canvas, colorOs16 ? colorOs16Revision("o0", "j0") : "p0", y);
-        XposedHelpers.setFloatField(canvas, colorOs16 ? colorOs16Revision("p0", "k0") : "q0", scale);
+        XposedHelpers.setFloatField(canvas, colorOs16 ? colorOs16Revision("n0", "i0", "f0") : "o0", x);
+        XposedHelpers.setFloatField(canvas, colorOs16 ? colorOs16Revision("o0", "j0", "g0") : "p0", y);
+        XposedHelpers.setFloatField(canvas, colorOs16 ? colorOs16Revision("p0", "k0", "h0") : "q0", scale);
     }
 
     /**
@@ -3310,7 +3321,7 @@ final class CanvasLayout {
             // i0/k0 在同类里会被 ART 内联，hook 不到，改在最外层 y0 改参数：
             // 四窗按三窗动画流程走，焦点在 3 时正好对上。
             if (!CanvasApi.isColorOs17()) XposedHelpers.findAndHookMethod(zoom,
-                    colorOs16Revision("y0", "x0"), int.class, int.class,
+                    colorOs16Revision("y0", "x0", "u0"), int.class, int.class,
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
                             try {
@@ -3520,7 +3531,7 @@ final class CanvasLayout {
             if (CanvasApi.usesScreenSizedOverview()) {
                 Class<?> decor = XposedHelpers.findClass(
                         CanvasApi.PACKAGE + "view.EmbeddedViewDecor", loader);
-                XposedHelpers.findAndHookMethod(decor, colorOs16Revision("E", "B"), Rect.class, boolean.class,
+                XposedHelpers.findAndHookMethod(decor, colorOs16Revision("E", "B", "z"), Rect.class, boolean.class,
                         new XC_MethodHook() {
                             @Override protected void beforeHookedMethod(MethodHookParam param) {
                                 View pane = (View) param.thisObject;
@@ -3937,13 +3948,13 @@ final class CanvasLayout {
     }
 
     private static void hookTwoPaneDividerMenu(Class<?> bar, Class<?> item) {
-        XposedHelpers.findAndHookMethod(bar, CanvasApi.hasColorOs16CanvasUpdate() ? "T" : "U",
+        XposedHelpers.findAndHookMethod(bar, CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("T", "T", "L") : "U",
                 item, new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam param) {
                 Object canvas = XposedHelpers.getObjectField(param.thisObject, "h");
                 Object adapter = CanvasApi.adapter(canvas);
                 if (adapter == null || count(adapter) != 2) return;
-                List<Object> items = (List<Object>) XposedHelpers.getObjectField(param.thisObject, "K");
+                List<Object> items = (List<Object>) XposedHelpers.getObjectField(param.thisObject, colorOs16Revision("K", "K", "H"));
                 items.removeIf(entry -> {
                     int action = (Integer) XposedHelpers.callMethod(entry, "m");
                     return action == 3 || action == 4;
@@ -3953,7 +3964,7 @@ final class CanvasLayout {
     }
 
     private static void hookColumnHandles(Class<?> bar) {
-        XposedHelpers.findAndHookMethod(bar, CanvasApi.hasColorOs16CanvasUpdate() ? "v" : "w",
+        XposedHelpers.findAndHookMethod(bar, CanvasApi.hasColorOs16CanvasUpdate() ? colorOs16Revision("v", "v", "r") : "w",
                 Rect.class, Rect.class, new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam param) {
                 Object handle = param.getResult();
@@ -5157,7 +5168,7 @@ final class CanvasLayout {
                 }
             };
             Class<?> policy = XposedHelpers.findClass(TABLET_POLICY.value(), loader);
-            XposedHelpers.findAndHookMethod(policy, colorOs16Revision("c", "f"), adapterType,
+            XposedHelpers.findAndHookMethod(policy, colorOs16Revision("c", "f", "c"), adapterType,
                     int.class, int.class, boolean.class, modeHook);
             if (CanvasApi.isColorOs17()) {
                 // 添加第三个任务时，控制器会在布局回调之前用手机策略求拆分模式。
